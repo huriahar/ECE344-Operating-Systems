@@ -1,0 +1,31 @@
+/*
+ * getpid - test getpid().
+ *
+ */
+
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <err.h>
+
+int
+main()
+{
+	runprogram("/testbin/add", "2 3");
+	/*
+	int mypid;
+    char c;
+	mypid = getpid();
+	printf("My PID is: %d\n", mypid);
+
+	mypid = fork();
+	printf("My PID is: %d\n", mypid);
+
+	
+    printf("enter one char: ");
+    c = getchar();
+    printf("input character is %c\n", c);
+    */
+	return 0;
+}

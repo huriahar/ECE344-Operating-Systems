@@ -1,0 +1,79 @@
+#include <syscall.h>
+#include <thread.h>
+#include <curthread.h>
+#include <kern/errno.h>
+#include <kern/unistd.h>
+#include <lib.h>
+
+/* 
+	Error codes from the MAN pages:
+
+	EBADF	fd is not a valid file descriptor, or was not opened for writing.
+	EFAULT	Part or all of the address space pointed to by buf is invalid.
+	ENOSPC	There is no free space remaining on the filesystem containing the file.
+	EIO	A hardware I/O error occurred writing the data.
+*/
+
+
+int sys_write(int fd, int buf, size_t nbytes, int* retval){
+
+	if(fd < STDIN_FILENO || fd >= STDERR_FILENO){
+		*retval = -1;
+		return EBADF;
+	}
+
+	if(buf == NULL){
+		*retval = -1;
+		return EFAULT;
+	}
+
+	char* buff = kmalloc(sizeof(char) * (nbytes+1));
+
+	if(buff == NULL){
+		*retval = -1;
+		return ENOMEM;
+	}
+
+	copyin(buf, buff, nbytes);
+	
+	if(buff == NULL){
+		*retval = -1;
+		return EFAULT;
+	}
+
+	buff[nbytes] = '\0';
+
+	kprintf("%s", buff);
+
+	kfree(buff);
+
+	*retval = nbytes;
+	return 0;
+}
+
+
+int sys_read(int fd, int buf, size_t nbytes, int* retval){
+
+	if(fd < STDIN_FILENO || fd >= STDERR_FILENO){
+		*retval = -1;
+		return EBADF;
+	}
+
+	if( nbytes == 0 ){
+		*retval = -1;
+		return EINVAL;
+	}
+
+	char* buff = (char*)buf;
+
+	*buff =getch(); //(buff, nbytes);
+
+	if(buff == NULL){
+		*retval = -1;
+		return EFAULT;
+	}
+
+	*retval = nbytes; //write one char at a time. one char = one byte
+	return 0;
+}
+

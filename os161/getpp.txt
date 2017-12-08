@@ -1,0 +1,818 @@
+Index: kern/arch/mips/mips/syscall.c
+===================================================================
+--- kern/arch/mips/mips/syscall.c	(revision 29)
++++ kern/arch/mips/mips/syscall.c	(working copy)
+@@ -101,7 +101,7 @@
+  		break;
+ 
+  		case SYS_execv:
+- 		err = sys_execv(tf->tf_a0, tf->tf_a1, &retval);
++ 		err = sys_execv(tf->tf_a0, tf->tf_a1);
+  		break;
+ 
+  		case SYS_sbrk:
+Index: kern/vm/vm.c
+===================================================================
+--- kern/vm/vm.c	(revision 29)
++++ kern/vm/vm.c	(working copy)
+@@ -8,43 +8,79 @@
+ #include <machine/spl.h>
+ #include <machine/tlb.h>
+ #include <synch.h>
++#include <elf.h>
++#include <kern/unistd.h>
++#include <vfs.h>
++#include <vnode.h>
++#include <kern/stat.h>
++#include <uio.h>
++#include <clock.h>
+ 
+-struct cmap_entry* cmap;
+ int vm_bootstrap_done = 0;
++
++struct cmap_entry *cmap;
+ struct lock* access_cmap;
+ unsigned long page_count;
+ 
+-#define DUMBVM_STACKPAGES    12
++struct vnode *swap_file;
++struct smap_entry *smap;
++unsigned long smap_page_count;
+ 
++// --------------------- in RAM---------------------------
++// [smap_start_physaddr, smap_start_physaddr + smap_size] --> smap
++// [cmap_start_physaddr, cmap_start_physaddr + cmap_size) --> coremap
++// [cmap_start_physaddr + cmap_size,  last_physaddr] --> system's free memory
++
++// -----------In the coremap-----------------------------
++// [0			 , cmapsize) --> fixed  - cmap
++// [cmapsize, last_physaddr] --> freed
++
+ void vm_bootstrap(void)
+ {
+-	//access_cmap = lock_create("access_cmap");
+-	paddr_t first_physaddr, last_physaddr, cmap_start_physaddr;
+-	unsigned long cmap_size;
++//	unsigned long i;
++	
++	//--------------------------------------- smap ----------------------------------------------------
++	unsigned long smap_size;
++	paddr_t smap_start_physaddr;
++	unsigned long i;
+ 
+-	//in kern/arch/mips/mips/ram.c
+-	ram_getsize(&first_physaddr, &last_physaddr);	
++	char file_name[9];
++	strcpy(file_name,"lhd0raw:");
++	
++	int ret = vfs_open(file_name, O_RDWR, &swap_file);
++	assert(ret == 0);
+ 
+-	// [cmap_start_physaddr, cmap_start_physaddr + cmap_size) --> coremap
+-	// [cmap_start_physaddr + cmap_size,  last_physaddr] --> system's free memory
++	struct stat swap_status;
++	VOP_STAT(swap_file, &swap_status);
+ 
+-	//number of pages the physical memory can store
+-	page_count = (last_physaddr - first_physaddr) / PAGE_SIZE;
++	smap_page_count = swap_status.st_size / PAGE_SIZE;
++	smap_size = smap_page_count * sizeof(struct smap_entry);
++	smap_size = DIVROUNDUP(smap_size, PAGE_SIZE);
++	smap_start_physaddr = ram_stealmem(smap_size);
++	smap = (struct smap_entry *) PADDR_TO_KVADDR(smap_start_physaddr);
+ 
+-	//need to allocate page_count entries in the cmap in order to keep track of each entry
+-	cmap_size = page_count * sizeof(struct cmap_entry);
+-	//round the cmap size to the nearest page
+-	cmap_size = DIVROUNDUP(cmap_size, PAGE_SIZE);
++	for(i = 0; i < smap_page_count; i++){
++		smap[i].disk_pa = (i*PAGE_SIZE);
++		smap[i].state = empty;
++		smap[i].as = NULL;
++		smap[i].va = 0;
++	}
+ 
+-	cmap_start_physaddr = ram_stealmem(cmap_size);	//pass number of pages we want to "steal". stolen pages won't be freed
++	smap_pages_avail = smap_page_count;
+ 
+-	//allocate the cmap in the first part of the physical memory
+-	cmap = (struct cmap_entry*) PADDR_TO_KVADDR(cmap_start_physaddr);
++	//--------------------------------------- coremap ----------------------------------------------------
++	paddr_t first_physaddr, last_physaddr;
++	paddr_t cmap_start_physaddr;
++	unsigned long cmap_size;
+ 
++	ram_getsize(&first_physaddr, &last_physaddr);	
+ 
+-	// [0			 , cmapsize) --> fixed  - cmap
+-	// [cmapsize, last_physaddr] --> freed
+-	unsigned long i;
++	page_count = (last_physaddr - first_physaddr) / PAGE_SIZE; 			//number of pages the physical memory can store
++	cmap_size = page_count * sizeof(struct cmap_entry);					//need to allocate page_count entries in the cmap in order to keep track of each entry
++	cmap_size = DIVROUNDUP(cmap_size, PAGE_SIZE);						//round the cmap size to the nearest page
++	cmap_start_physaddr = ram_stealmem(cmap_size);						//pass number of pages we want to "steal". stolen pages won't be freed
++	cmap = (struct cmap_entry*) PADDR_TO_KVADDR(cmap_start_physaddr);	//allocate the cmap in the first part of the physical memory
++
+ 	for(i = 0; i < page_count; i++){
+ 		if(i < cmap_size){
+ 			cmap[i].state = fixed;
+@@ -55,43 +91,27 @@
+ 			cmap[i].first_page = 0;
+ 		}
+ 		cmap[i].pa = cmap_start_physaddr + (i*PAGE_SIZE);
++		cmap[i].as = NULL;
++		cmap[i].s = 0;
++		cmap[i].ns = 0;
+ 	}
+ 
+ 	pages_avail = page_count - cmap_size;
+ 
+-	ram_getsize(&first_physaddr, &last_physaddr);
++	ram_reset();
+ 
+-	phys_addr_start = first_physaddr;
+-	phys_addr_end = last_physaddr;
+-
+-	ram_reset();
+-	
+ 	vm_bootstrap_done = 1;
+ }
+ 
+-
+ /*
+ 	return a pointer to the beginning of the physical address space allocated
+ 	allocating continous pages
+ */
+ 
+-paddr_t getppages(unsigned long npages)
++paddr_t getppages(unsigned long npages, page_state_t pstate)
+ {
+-	//dumbvm
+-	/*
+-	int spl;
+-	paddr_t addr;
+-
+-	spl = splhigh();
+-
+-	addr = ram_stealmem(npages);
+-	
+-	splx(spl);
+-	return addr;
+-	*/
+-
+-	paddr_t ret_addr = 0;	//alloc_kpages excepts a 0 upon failure
+-	if(vm_bootstrap_done==0){
++	paddr_t ret_addr = 0;	//alloc_upages excepts a 0 upon failure
++	if(vm_bootstrap_done == 0){
+ 		//if need to kmalloc before coremap is setup, then we're calling ram_stealmem
+ 		int spl = splhigh();
+ 		ret_addr = ram_stealmem(npages);
+@@ -101,8 +121,10 @@
+ 		//just allocate npages from the pages marked as free in the coremap
+ 		//lock_acquire(access_cmap);
+ 		int spl = splhigh();
+-		if (npages <= pages_avail) {
+-			//search the coremap for npages free pages
++		kprintf("pages avail = %d\n", pages_avail);
++	//	assert(npages <= pages_avail);
++		//search the coremap for npages free pages
++		if(npages <= pages_avail){
+ 			unsigned long i, j, k, nfound = 0;
+ 			for(i = 0; i < page_count; i++){
+ 				if (cmap[i].state == freed) {
+@@ -110,9 +132,17 @@
+ 
+ 					if (nfound == npages){
+ 						for(j = i, k=0; j > i-npages; j--, k++){
++							cmap[j].as = curthread->t_vmspace;
+ 							cmap[j].state = dirty;
+ 							cmap[j].num_pages = npages;
+-
++							cmap[j].p_state = pstate;
++							time_t s;
++							u_int32_t ns;
++							
++							gettime(&s, &ns);
++							cmap[j].s = s;
++							cmap[j].ns = ns;
++							
+ 							if(k==npages-1){ //first page in block
+ 								cmap[j].first_page = 1;
+ 								ret_addr = cmap[j].pa;
+@@ -128,7 +158,6 @@
+ 
+ 			}
+ 		}
+-		//lock_release(access_cmap);
+ 		splx(spl);
+ 	}
+ 	return ret_addr;
+@@ -139,7 +168,7 @@
+ alloc_kpages(int npages)
+ {
+ 	paddr_t pa;
+-	pa = getppages(npages);
++	pa = getppages(npages, kernel);
+ 	if (pa==0) {
+ 		return 0;
+ 	}
+@@ -146,6 +175,17 @@
+ 	return PADDR_TO_KVADDR(pa);
+ }
+ 
++vaddr_t 
++alloc_upages(int npages)
++{
++	paddr_t pa;
++	pa = getppages(npages, user);
++	if (pa==0) {
++		return 0;
++	}
++	return PADDR_TO_KVADDR(pa);
++}
++
+ void 
+ free_kpages(vaddr_t addr)
+ {
+@@ -166,11 +206,132 @@
+ 		}
+ 		cmap[i].first_page = 0;
+ 		pages_avail += length;
++		kprintf("length = %d\n", length);
++		kprintf("pages_avail = %d\n", pages_avail);
+ 	}
+ 	splx(spl);
+ 	//lock_release(access_cmap);
+ }
+ 
++unsigned long find_lru(){
++	unsigned long i;
++	unsigned long ret = page_count;
++
++	time_t min_s;
++	u_int32_t min_ns;
++	
++	gettime(&min_s, &min_ns);
++
++	for(i = 0; i < page_count; i++){
++		assert(cmap[i].state != freed);	//there cannot be any freed pages at this point. if there are freed pages, a page would have been allocated and no need to swap out
++		if(cmap[i].state == fixed) continue;
++		if(cmap[i].p_state == kernel) continue;
++
++		if(cmap[i].s < min_s){
++			min_s = cmap[i].s;
++			min_ns = cmap[i].ns;
++			ret = i;
++		}
++		else if(cmap[i].s == min_s){
++			if(cmap[i].ns < min_ns){
++				min_s = cmap[i].s;
++				min_ns = cmap[i].ns;
++				ret = i;
++			}
++		}
++	}
++	assert(ret < page_count);
++	return ret;
++}
++
++unsigned long get_space_on_disk(unsigned long index, vaddr_t faultaddress){
++	struct addrspace *as = cmap[index].as;
++	unsigned long i;
++	for(i = 0; i < smap_page_count; i++){
++		if(smap[i].as == as && smap[i].va == faultaddress)
++			break;
++		if(smap[i].state == empty){
++			assert( i >= (smap_page_count - smap_pages_avail));
++			break;
++		}
++	}
++	assert(i < smap_page_count);
++
++	smap[i].state = occupied;
++	smap[i].as = as;
++	smap[i].va = faultaddress;
++
++	return i;
++}
++
++/*
++	writes the old page content to disk, updates the smap
++*/
++void swap_out(unsigned long offset,vaddr_t va){
++	struct uio uio_swap;
++	
++	mk_kuio(&uio_swap,(void *)(va & PAGE_FRAME), PAGE_SIZE, offset, UIO_WRITE);
++
++	int ret = VOP_WRITE(swap_file, &uio_swap);
++	if(ret){
++		panic("couldn't write to disk");
++	}
++	//invalidate the evicted tlb entry
++	u_int32_t ehi,elo,i;
++	paddr_t pa = KVADDR_TO_PADDR(va);
++
++	for (i = 0; i < NUM_TLB; i++) {
++
++		TLB_Read(&ehi, &elo, i);
++
++		if ((elo & PAGE_FRAME) == (pa & PAGE_FRAME))	{
++			TLB_Write(TLBHI_INVALID(i), TLBLO_INVALID(), i);		
++		}
++	}
++	return;
++}
++
++void update_pte(unsigned long index){
++	struct pte *old_entry = cmap[index].as->pages;
++	while(old_entry != cmap[index].as->heap){
++		if(old_entry->pa == cmap[index].pa)
++			break;
++	}
++	assert(old_entry != cmap[index].as->heap);
++	old_entry->on_mem = 0;
++}
++
++paddr_t make_space(vaddr_t faultaddress){
++	unsigned long lru_index = find_lru();
++	unsigned long offset = get_space_on_disk(lru_index, faultaddress);
++	swap_out( offset, PADDR_TO_KVADDR(cmap[lru_index].pa));
++	update_pte(lru_index);
++}
++
++paddr_t demand_page(struct pte *entry){
++	assert (entry != NULL);
++	int spl = splhigh();
++	paddr_t pa = 0;
++
++	if(pages_avail > 0){
++		pa = KVADDR_TO_PADDR(alloc_upages(1));	//allocate one page
++		if(pa == 0){
++			splx(spl);
++			return ENOMEM;	//oops ran out of memory!!! :'(
++		}
++	}
++	else{
++		//TODO: entry's va is the same as the faultaddress???
++		pa = make_space(entry->va);
++	}
++	entry->pa = pa;
++	entry->on_mem = 1;
++	assert((pa & PAGE_FRAME) == pa);
++	splx(spl);
++	return entry->pa;
++}
++
++
+ int vm_fault(int faulttype, vaddr_t faultaddress)
+ {
+ 	
+@@ -221,6 +382,7 @@
+ 	assert((as->pages->pa & PAGE_FRAME) == as->pages->pa);
+ 	assert((as->regions->pa & PAGE_FRAME) == as->regions->pa);
+ 	assert((as->regions->pa & PAGE_FRAME) == as->regions->pa);
++	assert(faultaddress <= MIPS_KSEG0);
+ 
+ 	struct pte* entry;
+ 	paddr_t pa;
+@@ -229,8 +391,7 @@
+ 		entry = as->stack;
+ 		while(entry != NULL){	//search for the address in each of the stack pages
+ 			if(faultaddress >= entry->va && faultaddress < (entry->va + PAGE_SIZE)){
+-				//vaddr_t offset = faultaddress - entry->va;
+-				pa = entry->pa/* + offset*/;
++				pa = entry->pa;
+ 				break;
+ 			}
+ 			entry = entry->next;
+@@ -238,11 +399,9 @@
+ 	}
+ 	else if(faultaddress >= as->heap_begin && faultaddress < as->heap_end){
+ 		entry = as->heap;
+-
+ 		while(entry != NULL){	//search for the address in each of the stack pages
+ 			if(faultaddress >= entry->va && faultaddress < (entry->va + PAGE_SIZE)){
+-				//vaddr_t offset = faultaddress - entry->va;
+-				pa = entry->pa/* + offset*/;
++				pa = entry->pa;
+ 				break;
+ 			}
+ 			entry = entry->next;
+@@ -252,18 +411,24 @@
+ 		entry = as->pages;
+ 		while(entry != NULL){	//search for the address in each of the stack pages
+ 			if(faultaddress >= entry->va && faultaddress < (entry->va + PAGE_SIZE)){
+-				//vaddr_t offset = faultaddress - entry->va;
+-				pa = entry->pa/* + offset*/;
++				pa = entry->pa;
+ 				break;
+ 			}
+-			entry = entry->next;
++			entry = entry->next;   
+ 		}
+ 	}
+-	else{
++	else {
+ 		splx(spl);
+ 		return EFAULT;
+ 	}
+ 
++	assert(entry->va == faultaddress);
++
++	if(pa == 0 || pa == 0xdeadbeef){ //not in memory, but no page is allocated, need to allocate a new page
++		assert(entry->on_mem == 0);
++		pa = demand_page(entry);
++	}
++
+ 	// make sure it's page-aligned 
+ 	assert((pa & PAGE_FRAME)==pa);
+ 
+Index: kern/vm/addrspace.c
+===================================================================
+--- kern/vm/addrspace.c	(revision 29)
++++ kern/vm/addrspace.c	(working copy)
+@@ -8,9 +8,7 @@
+ #include <machine/spl.h>
+ #include <machine/tlb.h>
+ 
+-#define DUMBVM_STACKPAGES    12
+ 
+-
+ struct addrspace *
+ as_create(void)
+ {
+@@ -28,6 +26,25 @@
+ void
+ as_destroy(struct addrspace *as)
+ {
++	if (as != NULL) {
++		struct region_array *current_region = as->regions;
++		struct region_array *next_region;
++		while(current_region != NULL){
++			next_region = current_region->next;
++			kfree(current_region);
++			current_region = next_region;
++		}
++		as->regions = NULL;
++
++		struct pte *current_pte = as->pages;
++		struct pte *next_pte;
++		while (current_pte != NULL){
++			next_pte = current_pte->next;
++			kfree(current_pte);
++			current_pte = next_pte;
++		}
++		as->pages = NULL;
++	}
+ 	kfree(as);
+ }
+ 
+@@ -87,9 +104,7 @@
+ int
+ as_prepare_load(struct addrspace *as)
+ {
+-
+ 	struct region_array *region;
+-	struct pte *page_entry;
+ 	size_t i;
+ 	vaddr_t va;
+ 
+@@ -107,25 +122,18 @@
+ 				as->last_page = as->last_page->next;
+ 			}
+ 			struct pte *last = as->last_page;
+-			/*
+-			don't allocate the page just yet! only when DEMANDED (on-demand paging --> vm_fault)
+-			paddr_t pa = KVADDR_TO_PADDR(alloc_kpages(1));	//allocate one page
+-			if(pa == 0){
+-				return ENOMEM;	//oops ran out of memory!!! :'(
+-			}
+-			last->pa = pa;
+-			*/
++			
+ 			last->pa = 0;
+ 			last->va = va;
+ 			last->rwx = region->rwx;
++			last->on_mem = 0;
+ 			last->next = NULL;	//end of pte linked list
+-
+ 			va += PAGE_SIZE;
+ 		}
+ 		region = region->next;
+ 	}
+ 
+-	vaddr_t stackva = USERSTACK - DUMBVM_STACKPAGES* PAGE_SIZE;
++	vaddr_t stackva = USERSTACK - VM_STACKPAGES* PAGE_SIZE;
+ 	as->stack_begin = stackva;
+ 	as->stack_end = USERSTACK;
+ 
+@@ -132,21 +140,14 @@
+ 	struct pte* last = as->last_page;
+ 	struct pte *stack_page;
+ 
+-	for( i = 0; i < DUMBVM_STACKPAGES; i++){
++	for( i = 0; i < VM_STACKPAGES; i++){
+ 		stack_page = (struct pte *) kmalloc(sizeof(struct pte));
+ 		last->next = stack_page;
+-		/*
+-		don't allocate the page just yet! only when DEMANDED (on-demand paging --> vm_fault)
+-		paddr_t pa = KVADDR_TO_PADDR(alloc_kpages(1));	//allocate one page
+-		if(pa == 0){
+-			return ENOMEM;	//oops ran out of memory!!! :'(
+-		}
+-		stack_page->pa = pa;
+-		*/
+-		//stack_page->pa = 0;
++
++		stack_page->pa = 0;
+ 		stack_page->va = stackva;
+ 		stack_page->next = NULL;
+-
++		stack_page->on_mem = 0;
+ 		if(i == 0){
+ 			as->stack = stack_page;
+ 		}
+@@ -158,12 +159,13 @@
+ 
+ 	struct pte *heap_page = (struct pte *) kmalloc(sizeof(struct pte));
+ 	last->next = heap_page;
+-	paddr_t pa = KVADDR_TO_PADDR(alloc_kpages(1));	//allocate one page
++	paddr_t pa = KVADDR_TO_PADDR(alloc_upages(1));	//allocate one page
+ 	if(pa == 0){
+ 		return ENOMEM;	//oops ran out of memory!!! :'(
+ 	}
+ 	heap_page->pa = pa;
+ 	heap_page->va = va;
++	heap_page->on_mem = 1;
+ 	heap_page->next = NULL;
+ 
+ 	as->heap = heap_page;
+@@ -235,6 +237,16 @@
+ 	old_page = old->pages;
+ 	new_page = new->pages;
+ 	while(old_page != NULL){
++
++		if(old_page->pa != 0){
++			paddr_t pa = KVADDR_TO_PADDR(alloc_upages(1));	//allocate one page
++			if(pa == 0){
++				return ENOMEM;	//oops ran out of memory!!! :'(
++			}
++			new_page->pa = pa;
++			new_page->on_mem = 1;
++		}
++
+ 		memmove((void *)PADDR_TO_KVADDR(new_page->pa),
+ 				(const void *)PADDR_TO_KVADDR(old_page->pa),PAGE_SIZE);
+ 		old_page = old_page->next;
+Index: kern/include/elf.h
+===================================================================
+--- kern/include/elf.h	(revision 29)
++++ kern/include/elf.h	(working copy)
+@@ -164,4 +164,6 @@
+ typedef Elf32_Ehdr Elf_Ehdr;
+ typedef Elf32_Phdr Elf_Phdr;
+ 
++Elf_Ehdr eh;   /* Executable header */
++
+ #endif /* _ELF_H_ */
+Index: kern/include/syscall.h
+===================================================================
+--- kern/include/syscall.h	(revision 29)
++++ kern/include/syscall.h	(working copy)
+@@ -7,6 +7,8 @@
+  * Prototypes for IN-KERNEL entry points for system call implementations.
+  */
+ 
++ #define NUM_ARGS 10
++
+ int sys_reboot(int code);
+ 
+ int sys_write(int fd, int buf, size_t nbytes, int* retval);
+@@ -23,8 +25,10 @@
+ 
+ void free_mem(char** kargs, int end);
+ 
+-int sys_execv(const char *program, char **args, int *retval);
++int sys_execv(const char *program, char **args);
+ 
++//int sys_execv(char* progname, char** args);
++
+ int sys_sbrk(intptr_t amount, int *retval);
+ 
+ #endif /* _SYSCALL_H_ */
+Index: kern/include/vm.h
+===================================================================
+--- kern/include/vm.h	(revision 29)
++++ kern/include/vm.h	(working copy)
+@@ -3,28 +3,51 @@
+ 
+ #include <machine/vm.h>
+ 
+-
+-paddr_t phys_addr_start;
+-paddr_t phys_addr_end;
+-
+ unsigned long pages_avail;
++unsigned long smap_pages_avail;
+ 
+ typedef enum {
+ 	freed,
+-	dirty,
+ 	fixed,
++	dirty, 
+ 	clean
+-} pstate_t;
++} cmap_state_t;
+ 
++typedef enum {
++	empty,
++	occupied
++} smap_state_t;
++
++typedef enum {
++	kernel,
++	user
++} page_state_t;
++
++/*
++	cmap state can either be freed, fixed or occupied
++*/
+ struct cmap_entry{
+-	struct addrspace* as;
++	struct addrspace *as;
+ 	paddr_t pa;
+-	pstate_t state;
++	cmap_state_t state;
+ 	int first_page;
+ 	int num_pages;
++	time_t s;
++	u_int32_t ns;
++	page_state_t p_state;
+ };
+ 
++/*
++	smap state can either be freed or occupied
++*/
++struct smap_entry{
++	unsigned long disk_pa;
++	struct addrspace *as;
++	vaddr_t va;
++	smap_state_t state;
++};
+ 
++
+ /* Fault-type arguments to vm_fault() */
+ #define VM_FAULT_READ        0    /* A read was attempted */
+ #define VM_FAULT_WRITE       1    /* A write was attempted */
+@@ -33,7 +56,7 @@
+ 
+ /* Initialization function */
+ void vm_bootstrap(void);
+-paddr_t getppages(unsigned long npages);
++paddr_t getppages(unsigned long npages, page_state_t pstate);
+ 
+ /* Fault handling function called by trap code */
+ int vm_fault(int faulttype, vaddr_t faultaddress);
+@@ -40,6 +63,8 @@
+ 
+ /* Allocate/free kernel heap pages (called by kmalloc/kfree) */
+ vaddr_t alloc_kpages(int npages);
++vaddr_t alloc_upages(int npages);
++
+ void free_kpages(vaddr_t addr);
+ 
+ #endif /* _VM_H_ */
+Index: kern/include/addrspace.h
+===================================================================
+--- kern/include/addrspace.h	(revision 29)
++++ kern/include/addrspace.h	(working copy)
+@@ -4,8 +4,11 @@
+ #include <vm.h>
+ #include "opt-dumbvm.h"
+ 
++#define VM_STACKPAGES    24
++
+ struct vnode;
+ 
++
+ /* 
+  * Address space - data structure associated with the virtual memory
+  * space of a process.
+@@ -17,6 +20,7 @@
+ 	paddr_t pa;
+ 	vaddr_t va;
+ 	short rwx;
++	short on_mem;
+ 	struct pte *next;
+ };
+ 
+@@ -52,17 +56,7 @@
+ 
+ 	struct region_array *regions;
+ 	struct region_array *last_region;
+-	
+-	//dumbvm
+-	/*
+-	vaddr_t as_vbase1;
+-	paddr_t as_pbase1;
+-	size_t as_npages1;
+-	vaddr_t as_vbase2;
+-	paddr_t as_pbase2;
+-	size_t as_npages2;
+-	paddr_t as_stackpbase;
+-	*/
++
+ #endif
+ };
+ 
+Index: kern/userprog/process_syscalls.c
+===================================================================
+--- kern/userprog/process_syscalls.c	(revision 29)
++++ kern/userprog/process_syscalls.c	(working copy)
+@@ -95,16 +95,9 @@
+ 	return 0;
+ }
+ 
+-void free_mem(char** kargs, int end){
+-    int arg_num = 0;
+-    while( arg_num < end ){
+-        kfree(kargs[arg_num++]);
+-    }
+-    kfree(kargs);
+-}
+ 
+-int sys_execv(const char *program, char **args, int *retval){
+-	return 0;
++int sys_execv(const char *program, char **args){
++    return 0;
+ }
+ 
+ void free_last_n_pages(struct pte *cur){
+@@ -162,7 +155,7 @@
+ 				heap->next = (struct pte *)kmalloc(sizeof(struct pte));
+ 				heap = heap->next;
+ 				
+-				paddr_t pa = KVADDR_TO_PADDR(alloc_kpages(1));
++				paddr_t pa = KVADDR_TO_PADDR(alloc_upages(1));
+ 				if (pa == 0) {
+ 					*retval = -1;
+ 					return ENOMEM;
+@@ -169,8 +162,8 @@
+ 				}
+ 
+ 				heap->pa = pa;
+-				//kprintf("i : %d, pa: %x \n", i, pa);
+ 				heap->va = as->last_heap->va + (i+1)*PAGE_SIZE;
++				heap->on_mem = 1;
+ 				heap->next = NULL;
+ 			}
+ 			as->last_heap = heap;
+Index: kern/userprog/loadelf.c
+===================================================================
+--- kern/userprog/loadelf.c	(revision 29)
++++ kern/userprog/loadelf.c	(working copy)
+@@ -89,7 +89,6 @@
+ int
+ load_elf(struct vnode *v, vaddr_t *entrypoint)
+ {
+-	Elf_Ehdr eh;   /* Executable header */
+ 	Elf_Phdr ph;   /* "Program header" = segment header */
+ 	int result, i;
+ 	struct uio ku;
+@@ -193,7 +192,7 @@
+ 	/*
+ 	 * Now actually load each segment.
+ 	 */
+-
++	 
+ 	for (i=0; i<eh.e_phnum; i++) {
+ 		off_t offset = eh.e_phoff + i*eh.e_phentsize;
+ 		mk_kuio(&ku, &ph, sizeof(ph), offset, UIO_READ);
+@@ -204,15 +203,15 @@
+ 		}
+ 
+ 		if (ku.uio_resid != 0) {
+-			/* short read; problem with executable? */
++			// short read; problem with executable? 
+ 			kprintf("ELF: short read on phdr - file truncated?\n");
+ 			return ENOEXEC;
+ 		}
+ 
+ 		switch (ph.p_type) {
+-		    case PT_NULL: /* skip */ continue;
+-		    case PT_PHDR: /* skip */ continue;
+-		    case PT_MIPS_REGINFO: /* skip */ continue;
++		    case PT_NULL: continue;
++		    case PT_PHDR: continue;
++		    case PT_MIPS_REGINFO: continue;
+ 		    case PT_LOAD: break;
+ 		    default:
+ 			kprintf("loadelf: unknown segment type %d\n", 
+@@ -227,6 +226,7 @@
+ 			return result;
+ 		}
+ 	}
++	
+ 
+ 	result = as_complete_load(curthread->t_vmspace);
+ 	if (result) {

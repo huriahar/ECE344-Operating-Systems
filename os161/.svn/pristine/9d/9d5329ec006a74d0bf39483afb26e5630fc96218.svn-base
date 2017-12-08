@@ -1,0 +1,143 @@
+/*
+ * Sample/test code for running a user program.  You can use this for
+ * reference when implementing the execv() system call. Remember though
+ * that execv() needs to do more than this function does.
+ */
+
+#include <types.h>
+#include <kern/unistd.h>
+#include <kern/errno.h>
+#include <lib.h>
+#include <addrspace.h>
+#include <thread.h>
+#include <curthread.h>
+#include <vm.h>
+#include <vfs.h>
+#include <syscall.h>
+#include <test.h>
+
+/*
+ * Load program "progname" and start running it in usermode.
+ * Does not return except on error.
+ *
+ * Calls vfs_open on progname and thus may destroy it.
+ */
+int
+runprogram(char *progname, char** args, int arg_num)
+{
+	
+	/*if (progname == NULL || arg_num < 1 || args == NULL) {
+		return EFAULT;
+	}*/
+	struct vnode *v;
+	vaddr_t entrypoint, stackptr;
+	int ret;
+	//int arg_num = 0;
+	size_t official_length;
+	int original_arg_num = arg_num;
+	//char **kargs = (char **)kmalloc(sizeof(char*)*arg_num);
+	vaddr_t kargs[arg_num];
+
+
+	/* Open the file. */
+	ret = vfs_open(progname, O_RDONLY, &v);
+	if (ret) {
+		return ret;
+	}
+
+	/* We should be a new thread. */
+	assert(curthread->t_vmspace == NULL);
+
+	/* Create a new address space. */
+	curthread->t_vmspace = as_create();
+	if (curthread->t_vmspace==NULL) {
+		vfs_close(v);
+		return ENOMEM;
+	}
+
+	/* Activate it. */
+	as_activate(curthread->t_vmspace);
+
+	/* Load the executable. */
+	ret = load_elf(v, &entrypoint);
+	if (ret) {
+		/* thread_exit destroys curthread->t_vmspace */
+		vfs_close(v);
+		return ret;
+	}
+
+	/* Done with the file now. */
+	vfs_close(v);
+
+	/* Define the user stack in the address space */
+	ret = as_define_stack(curthread->t_vmspace, &stackptr);
+	if (ret) {
+		/* thread_exit destroys curthread->t_vmspace */
+		return ret;
+	}
+
+	if (args != NULL ) {
+		arg_num = arg_num-1;
+		while (arg_num >= 0) {
+	        //char *arg;
+	        int arg_len = strlen(args[arg_num]);
+	        arg_len++;
+	        int original_arg_len = arg_len;
+	        int rem = arg_len%4; // number of '\0' padding to align addresses with multiples of 4
+	        
+	        if (rem > 0)
+	        	arg_len += (4 - rem);
+            //arg = kmalloc(sizeof(char)*arg_len);
+
+
+	        /*if(karg == NULL){   //if kmalloc failed, return Not enough memory
+	            kfree(program_name);
+	            free_mem(kargs);
+	            return ENOMEM;
+	        }*/
+
+            //strcpy(arg, args[arg_num]);   //copy the value of kargs into karg
+
+            stackptr -= arg_len;
+	        ret = copyoutstr(args[arg_num], (userptr_t)stackptr, (size_t)original_arg_len, &official_length);
+
+	        if (ret != 0) {
+	        	return ret;
+	        }
+
+	        //kfree(arg);
+	        kargs[arg_num] = stackptr;
+	        arg_num--;
+	    }
+	    kargs[original_arg_num] = NULL;
+
+        //stackptr -= 4*sizeof(char);	// ??
+
+	    int i;
+	    for (i = (original_arg_num - 1); i >= 0; i--) {
+	        stackptr = stackptr - 4;
+	        ret = copyout(&kargs[i], (userptr_t)stackptr, 4);
+	        if (ret) {
+	            //kfree(program_name);
+	            //free_mem(kargs);
+	            //kfree(kargs); 
+	            return ret;           
+	        }
+	    }
+
+	    //kfree(program_name);
+	    //free_mem(kargs);
+
+		/* Warp to user mode. */
+		//md_usermode(0/*argc*/, NULL /*userspace addr of argv*/,
+		//	    stackptr, entrypoint);
+		md_usermode(original_arg_num, (userptr_t)stackptr, stackptr, entrypoint);
+	}
+	else
+		md_usermode(0, NULL, stackptr, entrypoint);
+	
+	
+	/* md_usermode does not return */
+	panic("md_usermode returned\n");
+	return EINVAL;
+}

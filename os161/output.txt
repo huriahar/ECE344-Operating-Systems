@@ -1,0 +1,495 @@
+Index: kern/include/addrspace.h
+===================================================================
+--- kern/include/addrspace.h	(revision 34)
++++ kern/include/addrspace.h	(working copy)
+@@ -96,7 +96,8 @@
+  */
+ 
+ struct addrspace *as_create(void);
+-int               as_copy(struct addrspace *src, struct addrspace **ret);
++//int               as_copy(struct addrspace *src, struct addrspace **ret);
++int 				as_copy(volatile struct addrspace *old, volatile struct addrspace **ret);
+ void              as_activate(struct addrspace *);
+ void              as_destroy(struct addrspace *);
+ 
+@@ -114,7 +115,7 @@
+ paddr_t demand_page(struct pte *entry, struct addrspace *as);
+ paddr_t load_page(struct pte *entry, struct addrspace *as);
+ unsigned long find_lru();
+-unsigned long get_space_on_disk(unsigned long index, vaddr_t faultaddress);
++unsigned long get_space_on_disk(unsigned long index, vaddr_t faultaddress, swap_type_t swap_type);
+ void swap_out(unsigned long offset,vaddr_t va);
+ void swap_in(unsigned long offset, vaddr_t va);
+ struct pte * update_pte(unsigned long index);
+Index: kern/include/vm.h
+===================================================================
+--- kern/include/vm.h	(revision 34)
++++ kern/include/vm.h	(working copy)
+@@ -23,6 +23,12 @@
+ 	user
+ } page_state_t;
+ 
++typedef enum{
++	SWAPIN,
++	SWAPOUT
++} swap_type_t;
++
++
+ /*
+ 	cmap state can either be freed, fixed or occupied
+ */
+Index: kern/userprog/process_syscalls.c
+===================================================================
+--- kern/userprog/process_syscalls.c	(revision 34)
++++ kern/userprog/process_syscalls.c	(working copy)
+@@ -39,7 +39,7 @@
+ 	memcpy(child_tf, tf,sizeof(struct trapframe));
+ 
+ 	// step 2 - copy the parent's address space to the parent's trapframe
+-	struct addrspace* child_as;
++	struct addrspace *child_as;
+ 
+ 	int ret = as_copy(curthread->t_vmspace, &child_as);
+ 	if(ret){
+Index: kern/vm/addrspace.c
+===================================================================
+--- kern/vm/addrspace.c	(revision 34)
++++ kern/vm/addrspace.c	(working copy)
+@@ -204,13 +204,95 @@
+ 	return 0;
+ }
+ 
++
+ /*
+ 	if as has old has a copy on disk, make a copy on disk
+ */
+ int
++as_copy(volatile struct addrspace *old, volatile struct addrspace **ret)
++{
++	//kprintf("as_copy: old as = %x new_as = %x\n", old, *ret);
++	//kprintf("\r");
++	int spl = splhigh();
++	volatile struct addrspace *new;
++
++	new = as_create();
++	if (new == NULL) {
++		return ENOMEM;
++	}
++
++	struct region_array *region, *new_region;
++
++	region = old->regions;
++	while(region != NULL){
++		if((new)->regions != NULL){
++			new_region = (new)->last_region;
++			
++			new_region->next = (struct region_array *) kmalloc(sizeof(struct region_array));
++			new_region = new_region->next;
++
++			(new)->last_region = new_region;
++		}
++		else{
++			(new)->regions = (struct region_array *) kmalloc(sizeof(struct region_array));
++			(new)->last_region = (new)->regions;
++			new_region = (new)->regions;
++		}
++
++		new_region->pa = region->pa;
++		new_region->va = region->va;
++		new_region->rwx = region->rwx;
++		new_region->num_pages = region->num_pages;
++		new_region->next = NULL;
++
++		region = region->next;
++	}
++
++	if (as_prepare_load(new)) {
++		as_destroy(new);
++		splx(spl);
++		return ENOMEM;
++	}
++
++	volatile struct pte *old_page, *new_page;
++	old_page = old->pages;
++	new_page = (new)->pages;
++	while(old_page != NULL){
++
++		paddr_t pa;
++
++		if((old_page->on_disk == 1) && (old_page->on_mem == 0)){
++			//kprintf("%d is on disk, let's load  it\n", old_page->va);
++			pa = load_page(old_page, old);	//load the old page on memory
++		}
++
++		if(old_page->on_mem == 1){
++			//kprintf("%d is on mem, let's copy\n",old_page->va);
++			pa = demand_page(new_page, new);
++			assert(pa != 0);
++			new_page->pa = pa;
++			new_page->on_mem = 1;
++		}
++
++		memmove((void *)PADDR_TO_KVADDR(new_page->pa),
++			(const void *)PADDR_TO_KVADDR(old_page->pa),PAGE_SIZE);
++
++		old_page = old_page->next;
++		new_page = new_page->next;
++	}
++
++	*ret = new;
++	splx(spl);
++	return 0;
++}
++
++/*
++	if as has old has a copy on disk, make a copy on disk
++
++int
+ as_copy(struct addrspace *old, struct addrspace **new)
+ {
+-	kprintf("as_copy: old as = %x new_as = %x\n", old, *new);
++	//kprintf("as_copy: old as = %x new_as = %x\n", old, *new);
+ 	//kprintf("\r");
+ 	int spl = splhigh();
+ 	//struct addrspace *new;
+@@ -282,3 +364,4 @@
+ 	splx(spl);
+ 	return 0;
+ }
++*/
+\ No newline at end of file
+Index: kern/vm/vm.c
+===================================================================
+--- kern/vm/vm.c	(revision 34)
++++ kern/vm/vm.c	(working copy)
+@@ -20,7 +20,7 @@
+ 
+ struct cmap_entry *cmap;
+ struct lock* access_cmap;
+-
++unsigned long cmap_size;
+ unsigned long page_count;
+ paddr_t cmap_start_physaddr;
+ 
+@@ -77,7 +77,6 @@
+ 
+ 	//--------------------------------------- coremap ----------------------------------------------------
+ 	paddr_t first_physaddr, last_physaddr;
+-	unsigned long cmap_size;
+ 
+ 	ram_getsize(&first_physaddr, &last_physaddr);	
+ 
+@@ -174,7 +173,7 @@
+ 								else{
+ 									kprintf("U: updated cmap ind = %d\n", i);	
+ 								}*/
+-								//kprintf("as = %x writing to page pa = %d\n", cmap[i].as, ret_addr);
++								//kprintf("writing to page index = %d\n", i);
+ 							}
+ 						}
+ 						break;
+@@ -208,11 +207,21 @@
+ 		// Make space on RAM
+ 		unsigned long lru_index = find_lru();
+ 		pa = cmap[lru_index].pa;
++		unsigned long offset;
++		int evict = 1;
++		if(cmap[lru_index].state == clean) evict = 0;
++		else evict = 1;
+ 		//kprintf("K: %x evicting page %d\n", curthread->t_vmspace, pa);
+ 		struct pte *evicted_pte = update_pte(lru_index);
++
++		//get space on disk must be called before updating the cmap entry. that way
++		//we look for the offset where the page to be evicted (using the old offset)
++		//was stored on disk (if it were stored on disk before) or we just get a new offset.
++		if(evict == 1)
++			offset = get_space_on_disk(lru_index, evicted_pte->va, SWAPOUT);
+ 		update_cmap(lru_index, NULL, dirty, kernel);
+-		unsigned long offset = get_space_on_disk(lru_index, evicted_pte->va);
+-		swap_out( offset, PADDR_TO_KVADDR(pa));
++		if(evict == 1)
++			swap_out( offset, PADDR_TO_KVADDR(pa));
+ 		splx(spl);
+ 	}
+ 	return PADDR_TO_KVADDR(pa);
+@@ -291,7 +300,7 @@
+ 	return ret;
+ }
+ 
+-unsigned long get_space_on_disk(unsigned long index, vaddr_t faultaddress){
++unsigned long get_space_on_disk(unsigned long index, vaddr_t faultaddress, swap_type_t swap_type){
+ 	struct addrspace *as = cmap[index].as;
+ 	unsigned long i;
+ 
+@@ -298,9 +307,18 @@
+ 	faultaddress = (faultaddress & PAGE_FRAME);
+ 
+ 	for(i = 0; i < smap_page_count; i++){
+-		if((smap[i].as == as) && smap[i].va == faultaddress)
++		if((smap[i].as == as) && smap[i].va == faultaddress){
++			//kprintf("loading (%x, %d) from offset %u\n", as, faultaddress, (i*PAGE_SIZE));
++			//if we find an old entry on disk. It could be either a swap_in or a swap_out operation
++			//swap_in: we're loading a page from disk that we had stored previously
++			//swap_out: we are re-evicting a page that used to be stored on disk before
+ 			break;
++		}
+ 		if(smap[i].state == empty){
++			//kprintf("writing (%x, %d) to offset %u\n", as, faultaddress, (i*PAGE_SIZE));
++			//if we are getting a new offset, it must be a swap_out operation
++			//if it were a swap_in operation, we should have found it earlier on disk!
++			assert(swap_type == SWAPOUT);
+ 			assert( i >= (smap_page_count - smap_pages_avail));
+ 			smap_pages_avail--;
+ 			break;
+@@ -418,12 +436,24 @@
+ 
+ 		// Make space on RAM
+ 		unsigned long lru_index = find_lru();
++		unsigned long offset;
+ 		pa = cmap[lru_index].pa;
+-		//kprintf("U: %x evicted a page %d\n", as, pa);
++		int evict = 1;
++		if(cmap[lru_index].state == clean) evict = 0;
++		else evict = 1;
++
+ 		struct pte *evicted_pte = update_pte(lru_index);
+-		update_cmap(lru_index, as, dirty, user);
+-		unsigned long offset = get_space_on_disk(lru_index, evicted_pte->va);
+-		swap_out( offset, PADDR_TO_KVADDR(pa));
++
++		// get_space_on_disk must be called before updating cmap. That way, get_space_on_disk finds on of these:
++		//	1) the offset where this page used to be stored, if it happened to be stored on disk before
++		//	2) a new offset on disk where the page can be evicted to, if this page was never stored on disk before
++		// to do so, it must use the old addrspace that used to own that cmap entry
++		if(evict == 1)
++			offset = get_space_on_disk(lru_index, evicted_pte->va, SWAPOUT);
++		update_cmap(lru_index, as, dirty, user);	//updates the cmap with the new as
++		//update_cmap must be called before swap_out
++		if(evict == 1)
++			swap_out( offset, PADDR_TO_KVADDR(pa));
+ 		entry->pa = pa;
+ 		entry->on_mem = 1;
+ 		//kprintf("U: evicting %d\n", lru_index);
+@@ -442,7 +472,7 @@
+ 	//lock_acquire(access_cmap);
+ 	paddr_t pa = 0;
+ 	unsigned long lru_index;
+-	unsigned long offset;
++	unsigned long evict_offset, swapin_offset;
+ 
+ 	if(pages_avail > 0){	//leave 5 pages for alloc_kpages?
+ 		pa = KVADDR_TO_PADDR(alloc_upages(1, as));	//allocate one page
+@@ -452,6 +482,20 @@
+ 			return ENOMEM;	//oops ran out of memory!!! :'(
+ 		}
+ 		lru_index = (pa - cmap_start_physaddr)/PAGE_SIZE;
++
++		//update cmap must first update the as that RAM page belongs to, so when we call get_space_on_disk
++		//we look for the offset where the page to be swapped in was soted on disk
++		update_cmap(lru_index, as, clean, user);
++		
++		//now get the offset where the page was stored on disk
++		swapin_offset = get_space_on_disk(lru_index, entry->va, SWAPIN);
++
++
++		swap_in(swapin_offset, PADDR_TO_KVADDR(pa));
++
++		assert(pa != 0);
++		entry->pa = pa;
++		entry->on_mem = 1;
+ 	}
+ 	else{
+ 		//TODO: entry's va is the same as the faultaddress???
+@@ -460,20 +504,40 @@
+ 		// Make space on RAM
+ 		lru_index = find_lru();
+ 		pa = cmap[lru_index].pa;
++		int evict = 1;
++		if(cmap[lru_index].state == clean) evict = 0;
++		else evict = 1;
++
+ 		struct pte *evicted_pte = update_pte(lru_index);
++
++		//evict_offset must be called before updating cmap. That way, get_space_on_disk finds on of these:
++		//	1) the offset where this page used to be stored, if it happened to be stored on disk before
++		//	2) a new offset on disk where the page can be evicted to, if this page was never stored on disk before
++		// to do so, it must use the old addrspace that used to own that cmap entry
++		if(evict == 1)
++			evict_offset = get_space_on_disk(lru_index, evicted_pte->va, SWAPOUT);
++
++		//after this, the cmap entry belongs to the as that is trying to get space on disk
+ 		update_cmap(lru_index, as, dirty, user);
+-		offset = get_space_on_disk(lru_index, evicted_pte->va);
+-		swap_out(offset, PADDR_TO_KVADDR(pa));
++
++		// Fill space on RAM
++		//now that the cmap entry has the addrspace to be swapped in, look for it on disk
++		swapin_offset = get_space_on_disk(lru_index, entry->va, SWAPIN);
++
++		//update the cmap entry to be clean
++		update_cmap(lru_index, as, clean, user);
++
++		if(evict == 1)
++			swap_out(evict_offset, PADDR_TO_KVADDR(pa));
++		swap_in(swapin_offset, PADDR_TO_KVADDR(pa));
++
++		assert(pa != 0);
++		entry->pa = pa;
++		entry->on_mem = 1;
+ 	}
+-
+-	// Fill space on RAM
+-	offset = get_space_on_disk(lru_index, entry->va);
+-	update_cmap(lru_index, as, clean, user);
+-	swap_in(offset, PADDR_TO_KVADDR(pa));
+-	entry->pa = pa;
+-	entry->on_mem = 1;
+ 	assert(entry->on_disk == 1);
+ 	assert((pa & PAGE_FRAME) == pa);
++
+ 	splx(spl);
+ 	//lock_release(access_cmap);
+ 	return entry->pa;	
+@@ -501,39 +565,33 @@
+ 	update_time(index);
+ }
+ 
+-int vm_fault(int faulttype, vaddr_t faultaddress)
+-{
+-	
+-	struct addrspace *as;
+-	int spl;
++int on_stack(vaddr_t faultaddress, struct addrspace *as){
++	if(faultaddress >= as->stack_begin && faultaddress < as->stack_end)
++		return 1;
++	return 0;
++}
+ 
+-	spl = splhigh();
++int on_heap(vaddr_t faultaddress, struct addrspace *as){
++	if(faultaddress >= as->heap_begin && faultaddress < as->heap_end)
++		return 1;
++	return 0;
++}
+ 
+-	faultaddress &= PAGE_FRAME;
++int on_region_pages(vaddr_t faultaddress, struct addrspace *as){
++	if(faultaddress >= as->pages->va && faultaddress < (as->last_page->va + PAGE_SIZE))
++		return 1;
++	return 0;
++}
+ 
+-	DEBUG(DB_VM, "dumbvm: fault: 0x%x\n", faultaddress);
+ 
+-	switch (faulttype) {
+-	    case VM_FAULT_READONLY:
+-		//We always create pages read-write, so we can't get this 
+-		panic("dumbvm: got VM_FAULT_READONLY\n");
+-	    case VM_FAULT_READ:
+-	    case VM_FAULT_WRITE:
+-		break;
+-	    default:
+-		splx(spl);
+-		return EINVAL;
+-	}
++struct pte *find_entry_on_mem(vaddr_t faultaddress, struct addrspace *as){
+ 
+-	as = curthread->t_vmspace;
+ 	if (as == NULL) {
+ 		
+ 		// No address space set up. This is probably a kernel
+ 		// fault early in boot. Return EFAULT so as to panic
+ 		// instead of getting into an infinite faulting loop.
+-		
+-		splx(spl);
+-		return EFAULT;
++		return NULL;
+ 	}
+ 
+ 	// Assert that the address space has been set up properly. 
+@@ -554,47 +612,66 @@
+ 	assert(faultaddress <= MIPS_KSEG0);
+ 
+ 	struct pte* entry;
+-	paddr_t pa;
+ 
+-	if(faultaddress >= as->stack_begin && faultaddress < as->stack_end){
++	if(on_stack(faultaddress, as)){
+ 		entry = as->stack;
+ 		while(entry != NULL){	//search for the address in each of the stack pages
+-			if(faultaddress >= entry->va && faultaddress < (entry->va + PAGE_SIZE)){
+-				pa = entry->pa;
+-				break;
+-			}
++			if((faultaddress >= entry->va) && faultaddress < (entry->va + PAGE_SIZE))break;
+ 			entry = entry->next;
+ 		}
+ 	}
+-	else if(faultaddress >= as->heap_begin && faultaddress < as->heap_end){
++	else if(on_heap(faultaddress, as)){
+ 		entry = as->heap;
+ 		while(entry != NULL){	//search for the address in each of the stack pages
+-			if(faultaddress >= entry->va && faultaddress < (entry->va + PAGE_SIZE)){
+-				pa = entry->pa;
+-				break;
+-			}
++			if((faultaddress >= entry->va) && faultaddress < (entry->va + PAGE_SIZE))break;
+ 			entry = entry->next;
+ 		}
+ 	}
+-	else if(faultaddress >= as->pages->va && faultaddress < (as->last_page->va + PAGE_SIZE)){
++	else if(on_region_pages(faultaddress, as)){
+ 		entry = as->pages;
+ 		while(entry != NULL){	//search for the address in each of the stack pages
+-			if(faultaddress >= entry->va && faultaddress < (entry->va + PAGE_SIZE)){
+-				pa = entry->pa;
+-				break;
+-			}
++			if((faultaddress >= entry->va) && faultaddress < (entry->va + PAGE_SIZE))break;
+ 			entry = entry->next;   
+ 		}
+ 	}
+ 	else {
++		return NULL;
++	}
++	assert(entry->va == faultaddress);
++	return entry;
++}
++
++int vm_fault(int faulttype, vaddr_t faultaddress)
++{
++	int spl = splhigh();
++
++	faultaddress &= PAGE_FRAME;
++
++	DEBUG(DB_VM, "dumbvm: fault: 0x%x\n", faultaddress);
++
++	switch (faulttype) {
++	    case VM_FAULT_READONLY:
++		//We always create pages read-write, so we can't get this 
++		panic("dumbvm: got VM_FAULT_READONLY\n");
++	    case VM_FAULT_READ:
++	    case VM_FAULT_WRITE:
++		break;
++	    default:
+ 		splx(spl);
++		return EINVAL;
++	}
++
++	struct addrspace *as = curthread->t_vmspace;
++	struct pte* entry;
++
++	entry = find_entry_on_mem(faultaddress, as);
++	if(entry == NULL){
++		splx(spl);
+ 		return EFAULT;
+ 	}
+ 
+-	assert(entry->va == faultaddress);
++	paddr_t pa = entry->pa;
+ 
+-	//kprintf("USER: in vm_fault\n");
+-
+ 	if(entry->on_mem == 0){
+ 		//assert((pa == 0) || (pa == 0xdeadbeef));
+ 		if(entry->on_disk == 1){

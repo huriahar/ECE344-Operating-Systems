@@ -1,0 +1,89 @@
+Running tests for Assignment 3
+Running: /cad2/ece344s/os161-tester/testing-scripts/asst3-01-palin.py
+palin
+PASS
+Mark for palin is 4 out of 4
+
+Running: /cad2/ece344s/os161-tester/testing-scripts/asst3-02-crash.py
+crash
+PASS
+PASS
+PASS
+PASS
+PASS
+PASS
+PASS
+PASS
+PASS
+PASS
+PASS
+PASS
+PASS
+Mark for crash is 13 out of 13
+
+Running: /cad2/ece344s/os161-tester/testing-scripts/asst3-03-addtest.py
+add
+PASS
+Mark for add is 5 out of 5
+
+Running: /cad2/ece344s/os161-tester/testing-scripts/asst3-04-argtest.py
+argtest
+PASS
+PASS
+PASS
+Mark for argtest is 8 out of 8
+
+Running: /cad2/ece344s/os161-tester/testing-scripts/asst3-05-sty.py
+sty
+PASS
+Mark for sty is 10 out of 10
+
+Running: /cad2/ece344s/os161-tester/testing-scripts/asst3-06-stacktest.py
+stacktest
+PASS
+Mark for stacktest is 5 out of 5
+
+Running: /cad2/ece344s/os161-tester/testing-scripts/asst3-08-triplebigprog.py
+triplebigprog
+TIMEOUT ERROR
+FAIL
+Mark for triplebigprog is 0 out of 20
+
+Running: /cad2/ece344s/os161-tester/testing-scripts/asst3-09-malloctest1.py
+malloctest 1
+PASS
+Mark for malloctest 1 is 5 out of 5
+
+Running: /cad2/ece344s/os161-tester/testing-scripts/asst3-10-malloctest5.py
+malloctest 5
+PASS
+Mark for malloctest 5 is 10 out of 10
+
+Running: /cad2/ece344s/os161-tester/testing-scripts/asst3-11-matmult.py
+matmult
+PASS
+Mark for matmult is 10 out of 10
+
+Running: /cad2/ece344s/os161-tester/testing-scripts/asst3-12-triplemult.py
+triplemat
+TIMEOUT ERROR
+FAIL
+Mark for triplemat is 0 out of 20
+
+Running: /cad2/ece344s/os161-tester/testing-scripts/asst3-13-malloctest2.py
+malloctest 2
+PASS
+Mark for malloctest 2 is 10 out of 10
+
+Running: /cad2/ece344s/os161-tester/testing-scripts/asst3-14-crasho.py
+crash o
+PASS
+Mark for crash o is 10 out of 10
+
+Running: /cad2/ece344s/os161-tester/testing-scripts/asst3-15-forktest.py
+forktest
+TIMEOUT ERROR
+FAIL
+Mark for forktest is 0 out of 10
+
+You received 90 marks out of 140

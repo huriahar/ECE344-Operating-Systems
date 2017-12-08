@@ -1,0 +1,70 @@
+#ifndef _VM_H_
+#define _VM_H_
+
+#include <machine/vm.h>
+
+unsigned long pages_avail;
+unsigned long smap_pages_avail;
+
+typedef enum {
+	freed,
+	fixed,
+	dirty, 
+	clean
+} cmap_state_t;
+
+typedef enum {
+	empty,
+	occupied
+} smap_state_t;
+
+typedef enum {
+	kernel,
+	user
+} page_state_t;
+
+/*
+	cmap state can either be freed, fixed or occupied
+*/
+struct cmap_entry{
+	struct addrspace *as;
+	paddr_t pa;
+	cmap_state_t state;
+	int first_page;
+	int num_pages;
+	time_t s;
+	u_int32_t ns;
+	page_state_t p_state;
+};
+
+/*
+	smap state can either be freed or occupied
+*/
+struct smap_entry{
+	unsigned long disk_pa;
+	struct addrspace *as;
+	vaddr_t va;
+	smap_state_t state;
+};
+
+
+/* Fault-type arguments to vm_fault() */
+#define VM_FAULT_READ        0    /* A read was attempted */
+#define VM_FAULT_WRITE       1    /* A write was attempted */
+#define VM_FAULT_READONLY    2    /* A write to a readonly page was attempted*/
+
+
+/* Initialization function */
+void vm_bootstrap(void);
+paddr_t getppages(unsigned long npages, page_state_t pstate);
+
+/* Fault handling function called by trap code */
+int vm_fault(int faulttype, vaddr_t faultaddress);
+
+/* Allocate/free kernel heap pages (called by kmalloc/kfree) */
+vaddr_t alloc_kpages(int npages);
+vaddr_t alloc_upages(int npages);
+
+void free_kpages(vaddr_t addr);
+
+#endif /* _VM_H_ */

@@ -1,0 +1,377 @@
+#include <types.h>
+#include <kern/errno.h>
+#include <lib.h>
+#include <thread.h>
+#include <curthread.h>
+#include <addrspace.h>
+#include <vm.h>
+#include <machine/spl.h>
+#include <machine/tlb.h>
+#include <synch.h>
+
+struct cmap_entry* cmap;
+int vm_bootstrap_done = 0;
+struct lock* access_cmap;
+unsigned long pages_avail, page_count;
+
+#define DUMBVM_STACKPAGES    12
+
+void vm_bootstrap(void)
+{
+	access_cmap = lock_create("access_cmap");
+	paddr_t first_physaddr, last_physaddr, cmap_start_physaddr;
+	unsigned long cmap_size;
+
+	//in kern/arch/mips/mips/ram.c
+	ram_getsize(&first_physaddr, &last_physaddr);	
+
+	// [cmap_start_physaddr, cmap_start_physaddr + cmap_size) --> coremap
+	// [cmap_start_physaddr + cmap_size,  last_physaddr] --> system's free memory
+
+	//number of pages the physical memory can store
+	page_count = (last_physaddr - first_physaddr) / PAGE_SIZE;
+
+	//need to allocate page_count entries in the cmap in order to keep track of each entry
+	cmap_size = page_count * sizeof(struct cmap_entry);
+	//round the cmap size to the nearest page
+	cmap_size = DIVROUNDUP(cmap_size, PAGE_SIZE);
+
+	cmap_start_physaddr = ram_stealmem(cmap_size);	//pass number of pages we want to "steal". stolen pages won't be freed
+
+	//allocate the cmap in the first part of the physical memory
+	cmap = (struct cmap_entry*) PADDR_TO_KVADDR(cmap_start_physaddr);
+
+
+	// [0			 , cmapsize) --> fixed  - cmap
+	// [cmapsize, last_physaddr] --> freed
+	unsigned long i;
+	for(i = 0; i < page_count; i++){
+		if(i < cmap_size){
+			cmap[i].state = fixed;
+		}
+		else{
+			cmap[i].state = freed;
+			cmap[i].num_pages = -1;
+			cmap[i].first_page = 0;
+		}
+		cmap[i].pa = cmap_start_physaddr + (i*PAGE_SIZE);
+	}
+
+	pages_avail = page_count - cmap_size;
+
+	ram_getsize(&first_physaddr, &last_physaddr);
+
+	phys_addr_start = first_physaddr;
+	phys_addr_end = last_physaddr;
+
+	ram_reset();
+	
+	vm_bootstrap_done = 1;
+}
+
+
+/*
+	return a pointer to the beginning of the physical address space allocated
+	allocating continous pages
+*/
+
+paddr_t getppages(unsigned long npages)
+{
+	//dumbvm
+	/*
+	int spl;
+	paddr_t addr;
+
+	spl = splhigh();
+
+	addr = ram_stealmem(npages);
+	
+	splx(spl);
+	return addr;
+	*/
+
+	paddr_t ret_addr = 0;	//alloc_kpages excepts a 0 upon failure
+	if(vm_bootstrap_done==0){
+		//if need to kmalloc before coremap is setup, then we're calling ram_stealmem
+		int spl = splhigh();
+		ret_addr = ram_stealmem(npages);
+		splx(spl);
+	}
+	else{
+		//just allocate npages from the pages marked as free in the coremap
+		lock_acquire(access_cmap);
+		if (npages <= pages_avail) {
+			//search the coremap for npages free pages
+			unsigned long i, j, k, nfound = 0;
+			for(i = 0; i < page_count; i++){
+				if (cmap[i].state == freed) {
+					nfound++;
+
+					if (nfound == npages){
+						for(j = i, k=0; j > i-npages; j--, k++){
+							cmap[j].state = dirty;
+							cmap[j].num_pages = npages;
+
+							if(k==npages-1){ //first page in block
+								cmap[j].first_page = 1;
+								ret_addr = cmap[j].pa;
+								pages_avail -= npages;
+							}
+						}
+						break;
+					}
+				}
+				else{
+					nfound = 0;
+				}
+
+			}
+		}
+		lock_release(access_cmap);
+	}
+	return ret_addr;
+}
+
+/* Allocate/free some kernel-space virtual pages */
+vaddr_t 
+alloc_kpages(int npages)
+{
+	paddr_t pa;
+	pa = getppages(npages);
+	if (pa==0) {
+		return 0;
+	}
+	return PADDR_TO_KVADDR(pa);
+}
+
+void 
+free_kpages(vaddr_t addr)
+{
+
+	lock_acquire(access_cmap);
+	paddr_t phy_addr = KVADDR_TO_PADDR(addr);
+	unsigned long i, j;
+	for(i = 0; i < page_count; i++) {
+		if (cmap[i].pa == phy_addr)
+			break;
+	}
+
+	if (cmap[i].first_page == 1){
+		unsigned long length = cmap[i].num_pages;
+		for (j = 0; j < length ; j++){
+			cmap[i+j].state = freed;
+			cmap[i+j].num_pages = -1;
+		}
+		cmap[i].first_page = 0;
+		pages_avail += length;
+	}
+
+	lock_release(access_cmap);
+}
+
+int vm_fault(int faulttype, vaddr_t faultaddress)
+{
+	
+	struct addrspace *as;
+	int spl;
+
+	spl = splhigh();
+
+	faultaddress &= PAGE_FRAME;
+
+	DEBUG(DB_VM, "dumbvm: fault: 0x%x\n", faultaddress);
+
+	switch (faulttype) {
+	    case VM_FAULT_READONLY:
+		//We always create pages read-write, so we can't get this 
+		panic("dumbvm: got VM_FAULT_READONLY\n");
+	    case VM_FAULT_READ:
+	    case VM_FAULT_WRITE:
+		break;
+	    default:
+		splx(spl);
+		return EINVAL;
+	}
+
+	as = curthread->t_vmspace;
+	if (as == NULL) {
+		
+		// No address space set up. This is probably a kernel
+		// fault early in boot. Return EFAULT so as to panic
+		// instead of getting into an infinite faulting loop.
+		
+		splx(spl);
+		return EFAULT;
+	}
+
+	// Assert that the address space has been set up properly. 
+
+	assert(as->pages != NULL);
+	assert(as->last_page != NULL);
+	assert(as->stack != NULL);
+	assert(as->last_stack != NULL);
+	assert(as->heap != NULL);
+	assert(as->heap_begin != 0);
+	assert(as->heap_end != 0);
+	assert(as->regions != NULL);
+	assert(as->last_region != NULL);
+	assert((as->pages->va & PAGE_FRAME) == as->pages->va);
+	assert((as->pages->pa & PAGE_FRAME) == as->pages->pa);
+	assert((as->regions->pa & PAGE_FRAME) == as->regions->pa);
+	assert((as->regions->pa & PAGE_FRAME) == as->regions->pa);
+
+	struct pte* entry;
+	paddr_t pa;
+
+	if(faultaddress >= as->stack_begin && faultaddress < as->stack_end){
+		entry = as->stack;
+		while(entry != NULL){	//search for the address in each of the stack pages
+			if(faultaddress >= entry->va && faultaddress < (entry->va + PAGE_SIZE)){
+				vaddr_t offset = faultaddress - entry->va;
+				pa = entry->pa + offset;
+				break;
+			}
+			entry = entry->next;
+		}
+	}
+	else if(faultaddress >= as->heap_begin && faultaddress < (as->heap_end + PAGE_SIZE)){
+		entry = as->heap;
+		if(faultaddress >= entry->va && faultaddress < (entry->va + PAGE_SIZE)){
+			vaddr_t offset = faultaddress - entry->va;
+			pa = entry->pa + offset;
+		}
+	}
+	else if(faultaddress >= as->pages->va && faultaddress < (as->last_page->va + PAGE_SIZE)){
+		entry = as->pages;
+		while(entry != NULL){	//search for the address in each of the stack pages
+			if(faultaddress >= entry->va && faultaddress < (entry->va + PAGE_SIZE)){
+				vaddr_t offset = faultaddress - entry->va;
+				pa = entry->pa + offset;
+				break;
+			}
+			entry = entry->next;
+		}
+	}
+	else{
+		splx(spl);
+		return EFAULT;
+	}
+
+	// make sure it's page-aligned 
+	assert((pa & PAGE_FRAME)==pa);
+
+	// Look for the 
+	u_int32_t ehi, elo;
+	int i;
+	for (i = 0; i < NUM_TLB; i++) {
+		TLB_Read(&ehi, &elo, i);
+		if (elo & TLBLO_VALID) {
+			continue;
+		}
+		ehi = faultaddress;
+		elo = pa | TLBLO_DIRTY | TLBLO_VALID;
+		DEBUG(DB_VM, "dumbvm: 0x%x -> 0x%x\n", faultaddress, pa);
+		TLB_Write(ehi, elo, i);
+		splx(spl);
+		return 0;
+	}
+
+	ehi = faultaddress;
+	elo = pa | TLBLO_DIRTY | TLBLO_VALID;
+	TLB_Random(ehi, elo);
+	splx(spl);
+	return 0;
+	
+/*
+	//dumbvm
+	vaddr_t vbase1, vtop1, vbase2, vtop2, stackbase, stacktop;
+	paddr_t paddr;
+	int i;
+	u_int32_t ehi, elo;
+	struct addrspace *as;
+	int spl;
+
+	spl = splhigh();
+
+	faultaddress &= PAGE_FRAME;
+
+	DEBUG(DB_VM, "dumbvm: fault: 0x%x\n", faultaddress);
+
+	switch (faulttype) {
+	    case VM_FAULT_READONLY:
+		// We always create pages read-write, so we can't get this
+		panic("dumbvm: got VM_FAULT_READONLY\n");
+	    case VM_FAULT_READ:
+	    case VM_FAULT_WRITE:
+		break;
+	    default:
+		splx(spl);
+		return EINVAL;
+	}
+
+	as = curthread->t_vmspace;
+	if (as == NULL) {
+		
+		// No address space set up. This is probably a kernel
+		// fault early in boot. Return EFAULT so as to panic
+		// instead of getting into an infinite faulting loop.
+		
+		return EFAULT;
+	}
+
+	// Assert that the address space has been set up properly. 
+	assert(as->as_vbase1 != 0);
+	assert(as->as_pbase1 != 0);
+	assert(as->as_npages1 != 0);
+	assert(as->as_vbase2 != 0);
+	assert(as->as_pbase2 != 0);
+	assert(as->as_npages2 != 0);
+	assert(as->as_stackpbase != 0);
+	assert((as->as_vbase1 & PAGE_FRAME) == as->as_vbase1);
+	assert((as->as_pbase1 & PAGE_FRAME) == as->as_pbase1);
+	assert((as->as_vbase2 & PAGE_FRAME) == as->as_vbase2);
+	assert((as->as_pbase2 & PAGE_FRAME) == as->as_pbase2);
+	assert((as->as_stackpbase & PAGE_FRAME) == as->as_stackpbase);
+
+	vbase1 = as->as_vbase1;
+	vtop1 = vbase1 + as->as_npages1 * PAGE_SIZE;
+	vbase2 = as->as_vbase2;
+	vtop2 = vbase2 + as->as_npages2 * PAGE_SIZE;
+	stackbase = USERSTACK - DUMBVM_STACKPAGES * PAGE_SIZE;
+	stacktop = USERSTACK;
+
+	if (faultaddress >= vbase1 && faultaddress < vtop1) {
+		paddr = (faultaddress - vbase1) + as->as_pbase1;
+	}
+	else if (faultaddress >= vbase2 && faultaddress < vtop2) {
+		paddr = (faultaddress - vbase2) + as->as_pbase2;
+	}
+	else if (faultaddress >= stackbase && faultaddress < stacktop) {
+		paddr = (faultaddress - stackbase) + as->as_stackpbase;
+	}
+	else {
+		splx(spl);
+		return EFAULT;
+	}
+
+	// make sure it's page-aligned 
+	assert((paddr & PAGE_FRAME)==paddr);
+
+	for (i=0; i<NUM_TLB; i++) {
+		TLB_Read(&ehi, &elo, i);
+		if (elo & TLBLO_VALID) {
+			continue;
+		}
+		ehi = faultaddress;
+		elo = paddr | TLBLO_DIRTY | TLBLO_VALID;
+		DEBUG(DB_VM, "dumbvm: 0x%x -> 0x%x\n", faultaddress, paddr);
+		TLB_Write(ehi, elo, i);
+		splx(spl);
+		return 0;
+	}
+
+	kprintf("dumbvm: Ran out of TLB entries - cannot handle page fault\n");
+	splx(spl);
+	return EFAULT;
+	*/
+}

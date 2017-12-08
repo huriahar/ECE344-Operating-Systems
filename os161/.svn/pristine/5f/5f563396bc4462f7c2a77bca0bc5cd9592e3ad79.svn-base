@@ -1,0 +1,143 @@
+#include <syscall.h>
+#include <thread.h>
+#include <curthread.h>
+#include <kern/errno.h>
+#include <kern/unistd.h>
+#include <machine/trapframe.h>
+#include <lib.h>
+#include <machine/spl.h>
+#include <synch.h>
+
+
+/*
+	System call implementation of getpid()
+	added to syscall.c
+*/
+int sys_getpid(int *retval){
+	*retval = curthread->t_pid;
+	return 0;
+}
+
+
+int sys__exit(int exitcode, int *retval){
+
+    int ppid = process_table[curthread->t_pid].ppid;
+    int pid = curthread->t_pid;
+    //if the parent has not exited, it is "interested" in the exitcode of the child
+    if(process_table[ppid].exited == 0){
+        process_table[pid].exit_code = exitcode;
+    }
+    else{ //if the parent has exited.... clean up yourself
+        process_table[pid].p_thread = NULL;
+        process_table[pid].pid = -1;
+        process_table[pid].ppid = -1;
+        process_table[pid].exited = 0;
+    }
+    thread_exit();
+    return 0;
+}
+
+/*
+	 
+EAGAIN	Too many processes already exist.
+ENOMEM	Sufficient virtual memory for the new process was not available.
+
+*/
+
+int sys_fork(struct trapframe *tf, int *retval){
+
+    lock_acquire(fork_lock);
+
+    struct trapframe* child_tf;
+    struct addrspace *child_as;
+    int ret;
+    struct thread* child_thread;
+
+    //first allocate the child trap frame on the kernel heap
+    child_tf = kmalloc(sizeof(struct trapframe));
+
+    //check if memory was allocate successfully or not enough memory
+    if(child_tf == NULL){
+        lock_release(fork_lock);
+        return ENOMEM;
+    }
+
+    //copy the trap frame into the new child tf
+    memcpy(child_tf, tf, sizeof(struct trapframe));
+
+    ret = as_copy(curthread->t_vmspace, &child_as);
+    if (ret) {
+        lock_release(fork_lock);
+        return ENOMEM;
+    }
+
+    //fork a child process
+    ret = thread_fork(curthread->t_name, child_tf, child_as, md_forkentry, &child_thread);
+
+    *retval = child_thread->t_pid;
+
+    if(ret) kfree(child_tf);
+
+    lock_release(fork_lock);
+
+    return ret;
+}
+
+/*
+    EINVAL      The options argument requested invalid or unsupported options.
+    EFAULT      The status argument was an invalid pointer.
+*/
+int sys_waitpid(int pid, int *status, int options, int *retval) {
+
+    // check that the pid is valid and the process exists
+    if(pid < PID_MIN || pid > MAX_PROCESSES || process_table[pid].p_thread == NULL ){
+        if(pid < PID_MIN)
+            kprintf("PID_MIN\n");
+        else if(pid > MAX_PROCESSES)
+            kprintf("MAX_PROCESSES\n");
+        else{
+            kprintf("process with pid = %d doesn't exist", pid);
+        }
+        return EINVAL;
+    }
+
+    //check that child is not waiting on the parent and that the parent of this child is the one that called waitpid
+    if( pid == process_table[curthread->t_pid].ppid || process_table[pid].ppid != curthread->t_pid ){
+        if(pid == process_table[curthread->t_pid].ppid)
+            kprintf("child is waiting on the parent\n");
+        else if(process_table[pid].ppid != curthread->t_pid)
+            kprintf("parent of this child is not the one that called waitpid\n");
+        return EINVAL;
+    }
+
+    //check that status is valid
+    if(!status){
+        kprintf("support is 0!!!!\n");
+        return EFAULT;
+    }
+
+    //no options supported atm - options should be 0
+    if(options != 0){
+        kprintf("option not supported!!!!\n");
+        return EINVAL;
+    }
+
+    while(process_table[pid].exited == 0){
+        P(process_table[pid].exit_semaphore);
+    }
+
+    int ret;
+
+    ret = copyout(&(process_table[pid].exit_code), status, sizeof(int));
+
+    if(ret) return EFAULT;
+
+    *retval = pid;
+/*
+    process_table[pid].p_thread = NULL;
+    process_table[pid].pid = -1;
+    process_table[pid].ppid = -1;
+    process_table[pid].exited = 0;
+*/
+    return 0;
+}

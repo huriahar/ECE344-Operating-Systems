@@ -1,0 +1,353 @@
+#include <syscall.h>
+#include <thread.h>
+#include <curthread.h>
+#include <kern/errno.h>
+#include <kern/unistd.h>
+#include <machine/trapframe.h>
+#include <lib.h>
+#include <machine/spl.h>
+#include <synch.h>
+#include <vfs.h>
+
+
+/*
+	System call implementation of getpid()
+	added to syscall.c
+*/
+int sys_getpid(int *retval){
+	*retval = curthread->t_pid;
+	return 0;
+}
+
+
+int sys__exit(int exitcode, int *retval){
+
+    int ppid = process_table[curthread->t_pid].ppid;
+    int pid = curthread->t_pid;
+    //if the parent has not exited, it is "interested" in the exitcode of the child
+    if(process_table[ppid].exited == 0){
+        process_table[pid].exit_code = exitcode;
+    }
+    else{ //if the parent has exited.... clean up yourself
+        process_table[pid].p_thread = NULL;
+        process_table[pid].pid = -1;
+        process_table[pid].ppid = -1;
+        process_table[pid].exited = 0;
+    }
+    thread_exit();
+    return 0;
+}
+
+/*
+	 
+EAGAIN	Too many processes already exist.
+ENOMEM	Sufficient virtual memory for the new process was not available.
+
+*/
+
+int sys_fork(struct trapframe *tf, int *retval){
+
+    lock_acquire(fork_lock);
+
+    struct trapframe* child_tf;
+    struct addrspace *child_as;
+    int ret;
+    struct thread* child_thread;
+
+    if(tf == NULL){
+        lock_release(fork_lock);
+        *retval = -1;
+        return EINVAL;
+    }
+
+    //first allocate the child trap frame on the kernel heap
+    child_tf = kmalloc(sizeof(struct trapframe));
+
+    //check if memory was allocate successfully or not enough memory
+    if(child_tf == NULL){
+        lock_release(fork_lock);
+        *retval = -1;
+        return ENOMEM;
+    }
+
+    //copy the trap frame into the new child tf
+    memcpy(child_tf, tf, sizeof(struct trapframe));
+
+    ret = as_copy(curthread->t_vmspace, &child_as);
+    if (ret) {
+        lock_release(fork_lock);
+        *retval = -1;
+        return ENOMEM;
+    }
+
+    //fork a child process
+    ret = thread_fork(curthread->t_name, child_tf, child_as, md_forkentry, &child_thread);
+
+    *retval = child_thread->t_pid;
+
+    if(ret) kfree(child_tf);
+
+    lock_release(fork_lock);
+
+    return ret;
+}
+
+/*
+    EINVAL      The options argument requested invalid or unsupported options.
+    EFAULT      The status argument was an invalid pointer.
+*/
+int sys_waitpid(int pid, int *status, int options, int *retval) {
+
+    // check that the pid is valid and the process exists
+    if(pid < PID_MIN || pid > MAX_PROCESSES || process_table[pid].p_thread == NULL ){
+        *retval = -1;
+        return EINVAL;
+    }
+
+    //check that child is not waiting on the parent and that the parent of this child is the one that called waitpid
+    if( pid == process_table[curthread->t_pid].ppid || process_table[pid].ppid != curthread->t_pid ){
+        *retval = -1;
+        return EINVAL;
+    }
+
+    //check that status is valid
+    if(!status){
+        *retval = -1;
+        return EFAULT;
+    }
+
+    //no options supported atm - options should be 0
+    if(options != 0){
+        *retval = -1;
+        return EINVAL;
+    }
+
+    while(process_table[pid].exited == 0){
+        P(process_table[pid].exit_semaphore);
+    }
+
+    int ret;
+
+    ret = copyout(&(process_table[pid].exit_code), status, sizeof(int));
+
+    if(ret){
+        *retval = -1;
+        return EFAULT;
+    } 
+
+    *retval = pid;
+/*
+    process_table[pid].p_thread = NULL;
+    process_table[pid].pid = -1;
+    process_table[pid].ppid = -1;
+    process_table[pid].exited = 0;
+*/
+    return 0;
+}
+
+
+void free_mem(char** kargs){
+    int arg_num = 0;
+    while(kargs[arg_num]){
+        kfree(kargs[arg_num++]);
+    }
+    kfree(kargs);
+}
+
+/*
+    ENODEV      The device prefix of program did not exist.
+    ENOTDIR     A non-final component of program was not a directory.
+    ENOENT      program did not exist.
+    EISDIR      program is a directory.
+    ENOEXEC     program is not in a recognizable executable file format, was for the wrong platform, or contained invalid fields.
+    ENOMEM      Insufficient virtual memory is available.
+    E2BIG       The total size of the argument strings is too large.
+    EIO         A hard I/O error occurred.
+    EFAULT      One of the args is an invalid pointer.
+*/
+
+//lockkkkkkkkkkkkkkkkkkkkkkkkkk
+//retval vs return????
+int sys_execv(const char *program, char **args, int *retval){
+
+    if(program == NULL)
+        return ENOEXEC;
+    
+    if (args == NULL)
+        return EFAULT;
+
+    //step 1 - Copy arguments from user space into kernel buffer
+
+    // step 1a - program name
+    char * program_name;
+    program_name = kmalloc(sizeof(char)*PATH_MAX);
+
+    int size;
+    int ret = copyinstr(program, program_name, PATH_MAX, &size);
+
+    if(ret){
+        kfree(program_name);
+        return EFAULT;
+    }
+    if(size == 1){   // program name is empty!!!
+        kfree(program_name);
+        return EINVAL;
+    }
+    //step 1b - args array
+    char **kargs = kmalloc(sizeof(char **));
+    ret = copyin(args, kargs, sizeof(char**));
+    if(ret) {
+        kfree(program_name);
+        kfree(kargs);
+        return EFAULT;
+    }
+
+    int arg_num = 0;
+    while (args[arg_num] != '\0') {
+        kargs[arg_num] = kmalloc(sizeof(char)*PATH_MAX);
+        ret = copyinstr(args[arg_num], kargs[arg_num], PATH_MAX, &size);
+
+        if(ret){
+            kfree(program_name);
+            free_mem(kargs);
+            return EFAULT;
+        }
+
+        if(size == 1){
+            kfree(program_name);
+            free_mem(kargs);
+            return EINVAL;
+        }
+
+        arg_num++;
+    }
+
+    kargs[arg_num] = '\0';
+
+    // step 2 - Open the executable, create a new address space and load the elf into it
+    // from runprogram()
+
+    struct vnode *v;
+    vaddr_t entrypoint, stackptr;
+
+    /* Open the file. */
+    ret = vfs_open(program_name, O_RDONLY, &v);
+    if (ret) {
+        kfree(program_name);
+        free_mem(kargs);
+        return ret;
+    }
+
+    if(curthread->t_vmspace) {
+        as_destroy(curthread->t_vmspace);
+        curthread->t_vmspace = NULL;
+    }
+
+    /* Create a new address space. */
+    curthread->t_vmspace = as_create();
+    if (curthread->t_vmspace==NULL) {
+        kfree(program_name);
+        free_mem(kargs);
+        vfs_close(v);
+        return ENOMEM;
+    }
+
+    /* Activate it. */
+    as_activate(curthread->t_vmspace);
+
+    /* Load the executable. */
+    ret = load_elf(v, &entrypoint);
+    if (ret) {
+        /* thread_exit destroys curthread->t_vmspace */
+        kfree(program_name);
+        free_mem(kargs); 
+        vfs_close(v);
+        return ret;
+    }
+
+    /* Done with the file now. */
+    vfs_close(v);
+
+    /* Define the user stack in the address space */
+    ret = as_define_stack(curthread->t_vmspace, &stackptr);
+    if (ret) {
+        /* thread_exit destroys curthread->t_vmspace */
+        kfree(program_name);
+        free_mem(kargs);
+        return ret;
+    }
+
+    //step 3 - Copy the arguments from kernel buffer into user stack
+    arg_num = 0;
+    while (kargs[arg_num]) {
+        char *karg;
+        int arg_len = strlen(kargs[arg_num]);
+        arg_len++;
+
+        int rem = arg_len%4; // number of '\0' padding to align addresses with multiples of 4
+        
+        if(rem > 0)          //allocate the new argument size based on str_size + padding
+            karg = kmalloc(sizeof(char)*(arg_len + 4-rem));
+        else
+            karg = kmalloc(sizeof(char)*(arg_len));
+
+
+        if(karg == NULL){   //if kmalloc failed, return Not enough memory
+            kfree(program_name);
+            free_mem(kargs);
+            return ENOMEM;
+        }
+
+        strcpy(karg, kargs[arg_num]);   //copy the value of kargs into karg
+
+        if(rem != 0){                   //if need to add padding, add it to karg
+            int i;
+            for( i = arg_len; i < arg_len + 4 - rem ; i++ ){
+                karg[i] = '\0';
+            }
+            arg_len += 4 - rem;
+        }
+
+        stackptr -= arg_len;
+
+        ret = copyout(karg, stackptr, arg_len);
+
+        if(ret){
+            kfree(program_name);
+            free_mem(kargs);
+            kfree(karg);
+            return ret;
+        }
+
+        kfree(karg);
+        kargs[arg_num] = (char *) stackptr;
+        arg_num++;
+    }
+
+    if (!kargs[arg_num]) 
+        stackptr -= 4*sizeof(char);
+    int i;
+    for (i = (arg_num - 1); i >= 0; i--) {
+        stackptr = stackptr - sizeof(char*);
+        ret = copyout((kargs + i), stackptr, sizeof(char*));
+        if (ret) {
+            kfree(program_name);
+            free_mem(kargs);
+            kfree(kargs); 
+            return ret;           
+        }
+    }
+
+    kfree(program_name);
+    free_mem(kargs);
+
+    //step 4 - Return user mode using md_usermode
+
+    /* Warp to user mode. */
+    md_usermode(arg_num, stackptr, stackptr, entrypoint);
+    
+    /* md_usermode does not return */
+    panic("md_usermode returned\n");
+    return EINVAL;
+
+}

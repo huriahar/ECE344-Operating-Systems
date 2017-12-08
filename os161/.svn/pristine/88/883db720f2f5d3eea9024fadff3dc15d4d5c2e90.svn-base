@@ -1,0 +1,102 @@
+#include <syscall.h>
+#include <thread.h>
+#include <curthread.h>
+#include <kern/errno.h>
+#include <kern/unistd.h>
+#include <machine/trapframe.h>
+#include <lib.h>
+#include <machine/spl.h>
+#include <synch.h>
+#include <vfs.h>
+
+
+int sys_getpid(int *retval){
+
+	*retval = curthread->t_pid;
+	return 0;
+}
+
+void sys__exit(int exitcode){
+	process_table[curthread->t_pid].exit_code = exitcode;
+	thread_exit();
+	return;
+}
+
+int sys_fork(struct trapframe *tf, int *retval){
+
+	assert(tf != NULL);
+
+	// step 1 - the trapframe: allocate new tf on the kernel heap, then copy the parent's tf into the child's
+
+	struct trapframe* child_tf;
+
+	child_tf = kmalloc(sizeof(struct trapframe));
+	if(child_tf == NULL){
+		return ENOMEM;
+	}
+
+	memcpy(child_tf, tf,sizeof(struct trapframe));
+
+	// step 2 - copy the parent's address space to the parent's trapframe
+	struct addrspace* child_as;
+
+	int ret = as_copy(curthread->t_vmspace, &child_as);
+	if(ret){
+		kfree(child_tf);
+		return ENOMEM;
+	}
+
+	// step 3 - fork the child process
+	struct thread* child_thread;
+	ret = thread_fork(curthread->t_name, child_tf, (unsigned long)child_as, md_forkentry, &child_thread);
+
+    if(ret) {
+        kfree(child_tf);
+        kfree(child_as);
+        return ret;
+    }
+
+    *retval = child_thread->t_pid;
+    return 0;
+}
+
+int sys_waitpid(int pid, int *status, int options, int *retval) {
+
+	assert(pid > PID_MIN);
+	assert(pid < MAX_PROCESSES);
+	if(status == NULL){
+		return EFAULT;
+	}
+
+	if(options != 0){
+		return EINVAL;
+	}
+
+	assert(curthread->t_pid == process_table[pid].ppid);
+
+	if(process_table[pid].exited == 1){ //if waiting on a process that has already exited, return immediately
+		*retval = pid;
+		*status = process_table[pid].exit_code;
+		return 0;	
+	}
+
+	//if waiting on the process that has yet to exit (exited==0)
+	P(process_table[pid].exit_semaphore);
+
+	*retval = pid;
+	*status = process_table[pid].exit_code;
+
+	//clean up the process of the child process that has exited
+	process_table[pid].ppid = -1;
+	process_table[pid].exited = 0;
+	sem_destroy(process_table[pid].exit_semaphore);
+
+	return 0;
+}
+
+/*
+int sys_execv(const char *program, char **args, int *retval){
+
+
+}
+*/

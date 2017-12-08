@@ -1,0 +1,6 @@
+forktest, 10, 10
+crash, 13, 13
+Testing faulter, 7, 7
+add, 5, 5
+argtest, 8, 8
+forkbomb, 8, 8

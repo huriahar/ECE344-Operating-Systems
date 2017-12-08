@@ -1,0 +1,47 @@
+Running tests for Assignment 2
+Running: /cad2/ece344s/os161-tester/testing-scripts/asst2-01-forktest.py
+forktest
+PASS
+Mark for forktest is 10 out of 10
+
+Running: /cad2/ece344s/os161-tester/testing-scripts/asst2-02-crash.py
+crash
+PASS
+PASS
+PASS
+PASS
+PASS
+PASS
+PASS
+PASS
+PASS
+PASS
+PASS
+PASS
+PASS
+Mark for crash is 13 out of 13
+
+Running: /cad2/ece344s/os161-tester/testing-scripts/asst2-03-faulter.py
+Testing faulter
+PASS
+Mark for Testing faulter is 7 out of 7
+
+Running: /cad2/ece344s/os161-tester/testing-scripts/asst2-04-addtest.py
+add
+PASS
+Mark for add is 5 out of 5
+
+Running: /cad2/ece344s/os161-tester/testing-scripts/asst2-05-argtest.py
+argtest
+PASS
+PASS
+PASS
+Mark for argtest is 8 out of 8
+
+Running: /cad2/ece344s/os161-tester/testing-scripts/asst2-06-forkbomb.py
+forkbomb
+TIMEOUT ERROR
+PASS
+Mark for forkbomb is 8 out of 8
+
+You received 51 marks out of 51

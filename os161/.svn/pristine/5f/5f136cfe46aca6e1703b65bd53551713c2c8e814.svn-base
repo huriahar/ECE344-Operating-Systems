@@ -1,0 +1,231 @@
+#include <syscall.h>
+#include <thread.h>
+#include <curthread.h>
+#include <kern/errno.h>
+#include <kern/unistd.h>
+#include <machine/trapframe.h>
+#include <lib.h>
+#include <machine/spl.h>
+#include <synch.h>
+#include <vfs.h>
+#include <addrspace.h>
+
+
+int sys_getpid(int *retval){
+
+	*retval = curthread->t_pid;
+	return 0;
+}
+
+void sys__exit(int exitcode){
+	process_table[curthread->t_pid].exit_code = exitcode;
+	thread_exit();
+	return;
+}
+
+int sys_fork(struct trapframe *tf, int *retval){
+
+	assert(tf != NULL);
+
+	// step 1 - the trapframe: allocate new tf on the kernel heap, then copy the parent's tf into the child's
+
+	struct trapframe* child_tf;
+
+	child_tf = kmalloc(sizeof(struct trapframe));
+	if(child_tf == NULL){
+		return ENOMEM;
+	}
+
+	memcpy(child_tf, tf,sizeof(struct trapframe));
+
+	// step 2 - copy the parent's address space to the parent's trapframe
+	struct addrspace* child_as;
+
+	int ret = as_copy(curthread->t_vmspace, &child_as);
+	if(ret){
+		kfree(child_tf);
+		return ENOMEM;
+	}
+
+	// step 3 - fork the child process
+	struct thread* child_thread;
+	ret = thread_fork(curthread->t_name, child_tf, (unsigned long)child_as, md_forkentry, &child_thread);
+
+    if(ret) {
+        kfree(child_tf);
+        kfree(child_as);
+        return ret;
+    }
+
+    *retval = child_thread->t_pid;
+    return 0;
+}
+
+int sys_waitpid(int pid, int *status, int options, int *retval) {
+
+	assert(pid > PID_MIN);
+	assert(pid < MAX_PROCESSES);
+	if(status == NULL){
+		return EFAULT;
+	}
+
+	if(options != 0){
+		return EINVAL;
+	}
+
+	assert(curthread->t_pid == process_table[pid].ppid);
+
+	if(process_table[pid].exited == 1){ //if waiting on a process that has already exited, return immediately
+		*retval = pid;
+		*status = process_table[pid].exit_code;
+		return 0;	
+	}
+
+	//if waiting on the process that has yet to exit (exited==0)
+	P(process_table[pid].exit_semaphore);
+
+	*retval = pid;
+	*status = process_table[pid].exit_code;
+
+	//clean up the process of the child process that has exited
+	process_table[pid].ppid = -1;
+	process_table[pid].exited = 0;
+	sem_destroy(process_table[pid].exit_semaphore);
+
+	return 0;
+}
+
+
+int sys_execv(const char *program, char **args){
+    return 0;
+}
+
+void free_last_n_pages(struct pte *cur){
+	if(cur == NULL)
+		return;
+	free_last_n_pages(cur->next);
+	free_kpages(cur->va);
+	return;
+}
+
+int sys_sbrk(intptr_t amount, int *retval){
+	struct addrspace *as = curthread->t_vmspace;
+
+	if (amount == 0) {
+		*retval = as->heap_end;
+		return 0;
+	}
+
+	if ((amount % 4) != 0){		// not byte aligned
+		*retval = -1;
+		return EINVAL;
+	}
+	//kprintf("amount: %lu \n", amount);
+	if (amount > 0) {
+		if ((amount + as->heap_end) > as->stack_begin) {
+			*retval = -1;
+			return ENOMEM;
+		}
+
+		// First, check if we need to allocate more pages else don't need to add more pages- use what you have! :P
+		if ((amount + as->heap_end) > (as->last_heap->va + PAGE_SIZE)){
+
+			intptr_t sub_amount = 0;
+
+			if (as->heap_end > as->last_heap->va)
+				sub_amount = (as->last_heap->va + PAGE_SIZE - as->heap_end);
+
+			int num_pages = (amount-sub_amount) / PAGE_SIZE;
+			if ((amount-sub_amount) % PAGE_SIZE != 0) {
+				num_pages += 1;
+			}
+
+			/*
+			if(as->heap_begin == as->heap_end){
+				num_pages -= 1;
+			}
+			*/
+			
+			if ((unsigned)num_pages > pages_avail) {
+				*retval = -1;
+				return ENOMEM;
+			}
+
+			struct pte *heap = as->last_heap;
+			int i;
+			for (i = 0; i < num_pages; i++) {
+				heap->next = (struct pte *)kmalloc(sizeof(struct pte));
+				heap = heap->next;
+
+				/*
+				paddr_t pa = KVADDR_TO_PADDR(alloc_upages(1, curthread->t_vmspace));
+				if (pa == 0) {
+					*retval = -1;
+					return ENOMEM;
+				}*/
+
+				heap->va = as->last_heap->va + (i+1)*PAGE_SIZE;
+
+				paddr_t pa = demand_page(heap, as);
+				assert(pa != 0);
+
+				heap->pa = pa;
+				heap->on_mem = 1;
+				heap->next = NULL;
+
+				assert((heap->va & PAGE_FRAME)==heap->va);
+			}
+			as->last_heap = heap;
+		}
+	}
+	else{	//amount is negative!
+		if ((long)as->heap_begin > (long)amount + (long)as->heap_end){
+			*retval = -1;
+			return EINVAL;
+		}
+
+		intptr_t abs_amount = amount*-1;
+		// First, check if we need to allocate more pages else don't need to add more pages- use what you have! :P
+		if ((amount + as->heap_end) <= as->last_heap->va){
+			intptr_t sub_amount = 0;
+
+			if (as->heap_end > as->last_heap->va)
+				sub_amount = (as->heap_end - as->last_heap->va);
+
+			int num_pages = (abs_amount-sub_amount) / PAGE_SIZE;
+			if ((abs_amount-sub_amount) % PAGE_SIZE != 0) {
+				num_pages += 1;
+			}
+
+
+			// You know that interview question where they ask you to find the nth last element in a linked list?
+			// Yeah, that's how you do ittt!
+			
+			struct pte *heap, *nth_last_heap;
+			heap = as->heap;
+			nth_last_heap = as->heap;
+			
+			int counter = num_pages;
+			while(counter--){
+				heap = heap->next;
+			}
+			assert(heap != NULL);
+
+			while(heap != as->last_heap){
+				heap = heap->next;
+				nth_last_heap = nth_last_heap->next;
+			}
+
+			//now free the last num_pages of the heap
+
+			free_last_n_pages(nth_last_heap->next);
+			nth_last_heap->next = NULL;
+			
+			//remember to update last_heap
+			as->last_heap = nth_last_heap;
+		}
+	}
+	*retval = as->heap_end;		//according to the man pages, retval = previous heap end
+	as->heap_end += amount;
+	return 0;
+}

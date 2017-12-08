@@ -1,0 +1,45 @@
+#include <syscall.h>
+#include <thread.h>
+#include <curthread.h>
+#include <kern/errno.h>
+#include <kern/unistd.h>
+
+
+
+/*
+	System call implementation of getpid()
+	added to syscall.c
+*/
+int sys_getpid(int *retval){
+	*retval = curthread->t_pid;
+	kprintf("retval = %d\n", *retval);
+	return 0;
+}
+
+
+int sys__exit(int *retval){
+	return ENOSYS;
+}
+
+/*
+	 
+EAGAIN	Too many processes already exist.
+ENOMEM	Sufficient virtual memory for the new process was not available.
+
+*/
+int sys_fork(struct trapframe *tf, int *retval){
+    struct trapframe *child_tf;
+    int ret;
+
+    //first allocate the child trap frame on the kernel heap
+    child_tf = kmalloc(sizeof(struct trapframe));
+
+    //check if memory was allocate successfully or not enough memory
+    if(child_tf == NULL) return ENOMEM;
+
+    //fork a child process
+    ret = thread_fork(curthread->t_name, start_child_thread, child_tf, 0, retval);
+
+    if(ret) kfree(child_tf);
+    return ret;
+}

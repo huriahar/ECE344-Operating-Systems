@@ -1,0 +1,1434 @@
+Index: kern/userprog/process_syscalls.c
+===================================================================
+--- kern/userprog/process_syscalls.c	(revision 20)
++++ kern/userprog/process_syscalls.c	(working copy)
+@@ -10,344 +10,93 @@
+ #include <vfs.h>
+ 
+ 
+-/*
+-	System call implementation of getpid()
+-	added to syscall.c
+-*/
+ int sys_getpid(int *retval){
++
+ 	*retval = curthread->t_pid;
+ 	return 0;
+ }
+ 
+-
+-int sys__exit(int exitcode, int *retval){
+-
+-    int ppid = process_table[curthread->t_pid].ppid;
+-    int pid = curthread->t_pid;
+-    //if the parent has not exited, it is "interested" in the exitcode of the child
+-    if(process_table[ppid].exited == 0){
+-        process_table[pid].exit_code = exitcode;
+-    }
+-    else{ //if the parent has exited.... clean up yourself
+-        process_table[pid].p_thread = NULL;
+-        process_table[pid].pid = -1;
+-        process_table[pid].ppid = -1;
+-        process_table[pid].exited = 0;
+-    }
+-    thread_exit();
+-    return 0;
++void sys__exit(int exitcode){
++	process_table[curthread->t_pid].exit_code = exitcode;
++	thread_exit();
++	return;
+ }
+ 
+-/*
+-	 
+-EAGAIN	Too many processes already exist.
+-ENOMEM	Sufficient virtual memory for the new process was not available.
++int sys_fork(struct trapframe *tf, int *retval){
+ 
+-*/
++	assert(tf != NULL);
+ 
+-int sys_fork(struct trapframe *tf, int *retval){
++	// step 1 - the trapframe: allocate new tf on the kernel heap, then copy the parent's tf into the child's
+ 
+-    lock_acquire(fork_lock);
++	struct trapframe* child_tf;
+ 
+-    struct trapframe* child_tf;
+-    struct addrspace *child_as;
+-    int ret;
+-    struct thread* child_thread;
++	child_tf = kmalloc(sizeof(struct trapframe));
++	if(child_tf == NULL){
++		return ENOMEM;
++	}
+ 
+-    if(tf == NULL){
+-        lock_release(fork_lock);
+-        *retval = -1;
+-        return EINVAL;
+-    }
++	memcpy(child_tf, tf,sizeof(struct trapframe));
+ 
+-    //first allocate the child trap frame on the kernel heap
+-    child_tf = kmalloc(sizeof(struct trapframe));
++	// step 2 - copy the parent's address space to the parent's trapframe
++	struct addrspace* child_as;
+ 
+-    //check if memory was allocate successfully or not enough memory
+-    if(child_tf == NULL){
+-        lock_release(fork_lock);
+-        *retval = -1;
+-        return ENOMEM;
+-    }
++	int ret = as_copy(curthread->t_vmspace, &child_as);
++	if(ret){
++		kfree(child_tf);
++		return ENOMEM;
++	}
+ 
+-    //copy the trap frame into the new child tf
+-    memcpy(child_tf, tf, sizeof(struct trapframe));
++	// step 3 - fork the child process
++	struct thread* child_thread;
++	ret = thread_fork(curthread->t_name, child_tf, (unsigned long)child_as, md_forkentry, &child_thread);
+ 
+-    ret = as_copy(curthread->t_vmspace, &child_as);
+-    if (ret) {
+-        lock_release(fork_lock);
+-        *retval = -1;
+-        return ENOMEM;
++    if(ret) {
++        kfree(child_tf);
++        kfree(child_as);
++        return ret;
+     }
+ 
+-    //fork a child process
+-    ret = thread_fork(curthread->t_name, child_tf, child_as, md_forkentry, &child_thread);
+-
+     *retval = child_thread->t_pid;
+-
+-    if(ret) kfree(child_tf);
+-
+-    lock_release(fork_lock);
+-
+-    return ret;
++    return 0;
+ }
+ 
+-/*
+-    EINVAL      The options argument requested invalid or unsupported options.
+-    EFAULT      The status argument was an invalid pointer.
+-*/
+ int sys_waitpid(int pid, int *status, int options, int *retval) {
+ 
+-    // check that the pid is valid and the process exists
+-    if(pid < PID_MIN || pid > MAX_PROCESSES || process_table[pid].p_thread == NULL ){
+-        *retval = -1;
+-        return EINVAL;
+-    }
++	assert(pid > PID_MIN);
++	assert(pid < MAX_PROCESSES);
++	if(status == NULL){
++		return EFAULT;
++	}
+ 
+-    //check that child is not waiting on the parent and that the parent of this child is the one that called waitpid
+-    if( pid == process_table[curthread->t_pid].ppid || process_table[pid].ppid != curthread->t_pid ){
+-        *retval = -1;
+-        return EINVAL;
+-    }
++	if(options != 0){
++		return EINVAL;
++	}
+ 
+-    //check that status is valid
+-    if(!status){
+-        *retval = -1;
+-        return EFAULT;
+-    }
++	assert(curthread->t_pid == process_table[pid].ppid);
+ 
+-    //no options supported atm - options should be 0
+-    if(options != 0){
+-        *retval = -1;
+-        return EINVAL;
+-    }
++	if(process_table[pid].exited == 1){ //if waiting on a process that has already exited, return immediately
++		*retval = pid;
++		*status = process_table[pid].exit_code;
++		return 0;	
++	}
+ 
+-    while(process_table[pid].exited == 0){
+-        P(process_table[pid].exit_semaphore);
+-    }
++	//if waiting on the process that has yet to exit (exited==0)
++	P(process_table[pid].exit_semaphore);
+ 
+-    int ret;
++	*retval = pid;
++	*status = process_table[pid].exit_code;
+ 
+-    ret = copyout(&(process_table[pid].exit_code), status, sizeof(int));
++	//clean up the process of the child process that has exited
++	process_table[pid].ppid = -1;
++	process_table[pid].exited = 0;
++	sem_destroy(process_table[pid].exit_semaphore);
+ 
+-    if(ret){
+-        *retval = -1;
+-        return EFAULT;
+-    } 
++	return 0;
++}
+ 
+-    *retval = pid;
+ /*
+-    process_table[pid].p_thread = NULL;
+-    process_table[pid].pid = -1;
+-    process_table[pid].ppid = -1;
+-    process_table[pid].exited = 0;
+-*/
+-    return 0;
+-}
++int sys_execv(const char *program, char **args, int *retval){
+ 
+ 
+-void free_mem(char** kargs){
+-    int arg_num = 0;
+-    while(kargs[arg_num]){
+-        kfree(kargs[arg_num++]);
+-    }
+-    kfree(kargs);
+ }
+-
+-/*
+-    ENODEV      The device prefix of program did not exist.
+-    ENOTDIR     A non-final component of program was not a directory.
+-    ENOENT      program did not exist.
+-    EISDIR      program is a directory.
+-    ENOEXEC     program is not in a recognizable executable file format, was for the wrong platform, or contained invalid fields.
+-    ENOMEM      Insufficient virtual memory is available.
+-    E2BIG       The total size of the argument strings is too large.
+-    EIO         A hard I/O error occurred.
+-    EFAULT      One of the args is an invalid pointer.
+ */
+-
+-//lockkkkkkkkkkkkkkkkkkkkkkkkkk
+-//retval vs return????
+-int sys_execv(const char *program, char **args, int *retval){
+-
+-    if(program == NULL)
+-        return ENOEXEC;
+-    
+-    if (args == NULL)
+-        return EFAULT;
+-
+-    //step 1 - Copy arguments from user space into kernel buffer
+-
+-    // step 1a - program name
+-    char * program_name;
+-    program_name = kmalloc(sizeof(char)*PATH_MAX);
+-
+-    int size;
+-    int ret = copyinstr(program, program_name, PATH_MAX, &size);
+-
+-    if(ret){
+-        kfree(program_name);
+-        return EFAULT;
+-    }
+-    if(size == 1){   // program name is empty!!!
+-        kfree(program_name);
+-        return EINVAL;
+-    }
+-    //step 1b - args array
+-    char **kargs = kmalloc(sizeof(char **));
+-    ret = copyin(args, kargs, sizeof(char**));
+-    if(ret) {
+-        kfree(program_name);
+-        kfree(kargs);
+-        return EFAULT;
+-    }
+-
+-    int arg_num = 0;
+-    while (args[arg_num] != '\0') {
+-        kargs[arg_num] = kmalloc(sizeof(char)*PATH_MAX);
+-        ret = copyinstr(args[arg_num], kargs[arg_num], PATH_MAX, &size);
+-
+-        if(ret){
+-            kfree(program_name);
+-            free_mem(kargs);
+-            return EFAULT;
+-        }
+-
+-        if(size == 1){
+-            kfree(program_name);
+-            free_mem(kargs);
+-            return EINVAL;
+-        }
+-
+-        arg_num++;
+-    }
+-
+-    kargs[arg_num] = '\0';
+-
+-    // step 2 - Open the executable, create a new address space and load the elf into it
+-    // from runprogram()
+-
+-    struct vnode *v;
+-    vaddr_t entrypoint, stackptr;
+-
+-    /* Open the file. */
+-    ret = vfs_open(program_name, O_RDONLY, &v);
+-    if (ret) {
+-        kfree(program_name);
+-        free_mem(kargs);
+-        return ret;
+-    }
+-
+-    if(curthread->t_vmspace) {
+-        as_destroy(curthread->t_vmspace);
+-        curthread->t_vmspace = NULL;
+-    }
+-
+-    /* Create a new address space. */
+-    curthread->t_vmspace = as_create();
+-    if (curthread->t_vmspace==NULL) {
+-        kfree(program_name);
+-        free_mem(kargs);
+-        vfs_close(v);
+-        return ENOMEM;
+-    }
+-
+-    /* Activate it. */
+-    as_activate(curthread->t_vmspace);
+-
+-    /* Load the executable. */
+-    ret = load_elf(v, &entrypoint);
+-    if (ret) {
+-        /* thread_exit destroys curthread->t_vmspace */
+-        kfree(program_name);
+-        free_mem(kargs); 
+-        vfs_close(v);
+-        return ret;
+-    }
+-
+-    /* Done with the file now. */
+-    vfs_close(v);
+-
+-    /* Define the user stack in the address space */
+-    ret = as_define_stack(curthread->t_vmspace, &stackptr);
+-    if (ret) {
+-        /* thread_exit destroys curthread->t_vmspace */
+-        kfree(program_name);
+-        free_mem(kargs);
+-        return ret;
+-    }
+-
+-    //step 3 - Copy the arguments from kernel buffer into user stack
+-    arg_num = 0;
+-    while (kargs[arg_num]) {
+-        char *karg;
+-        int arg_len = strlen(kargs[arg_num]);
+-        arg_len++;
+-
+-        int rem = arg_len%4; // number of '\0' padding to align addresses with multiples of 4
+-        
+-        if(rem > 0)          //allocate the new argument size based on str_size + padding
+-            karg = kmalloc(sizeof(char)*(arg_len + 4-rem));
+-        else
+-            karg = kmalloc(sizeof(char)*(arg_len));
+-
+-
+-        if(karg == NULL){   //if kmalloc failed, return Not enough memory
+-            kfree(program_name);
+-            free_mem(kargs);
+-            return ENOMEM;
+-        }
+-
+-        strcpy(karg, kargs[arg_num]);   //copy the value of kargs into karg
+-
+-        if(rem != 0){                   //if need to add padding, add it to karg
+-            int i;
+-            for( i = arg_len; i < arg_len + 4 - rem ; i++ ){
+-                karg[i] = '\0';
+-            }
+-            arg_len += 4 - rem;
+-        }
+-
+-        stackptr -= arg_len;
+-
+-        ret = copyout(karg, stackptr, arg_len);
+-
+-        if(ret){
+-            kfree(program_name);
+-            free_mem(kargs);
+-            kfree(karg);
+-            return ret;
+-        }
+-
+-        kfree(karg);
+-        kargs[arg_num] = (char *) stackptr;
+-        arg_num++;
+-    }
+-
+-    if (!kargs[arg_num]) 
+-        stackptr -= 4*sizeof(char);
+-    int i;
+-    for (i = (arg_num - 1); i >= 0; i--) {
+-        stackptr = stackptr - sizeof(char*);
+-        ret = copyout((kargs + i), stackptr, sizeof(char*));
+-        if (ret) {
+-            kfree(program_name);
+-            free_mem(kargs);
+-            kfree(kargs); 
+-            return ret;           
+-        }
+-    }
+-
+-    kfree(program_name);
+-    free_mem(kargs);
+-
+-    //step 4 - Return user mode using md_usermode
+-
+-    /* Warp to user mode. */
+-    md_usermode(arg_num, stackptr, stackptr, entrypoint);
+-    
+-    /* md_usermode does not return */
+-    panic("md_usermode returned\n");
+-    return EINVAL;
+-
+-}
+\ No newline at end of file
+Index: kern/userprog/file_syscalls.c
+===================================================================
+--- kern/userprog/file_syscalls.c	(revision 20)
++++ kern/userprog/file_syscalls.c	(working copy)
+@@ -14,66 +14,55 @@
+ 	EIO	A hardware I/O error occurred writing the data.
+ */
+ 
+-
+ int sys_write(int fd, int buf, size_t nbytes, int* retval){
+ 
+-	if(fd < STDIN_FILENO || fd >= STDERR_FILENO){
+-		*retval = -1;
+-		return EBADF;
+-	}
++    if(fd < STDIN_FILENO || fd > STDERR_FILENO){
++        return EBADF;
++    }
+ 
+-	if(buf == NULL){
+-		*retval = -1;
+-		return EFAULT;
+-	}
++    if(buf == NULL){
++        return EFAULT;
++    }
+ 
+-	char* buff = kmalloc(sizeof(char) * (nbytes+1));
++    char* buff = kmalloc(sizeof(char) * (nbytes+1));
+ 
+-	if(buff == NULL){
+-		*retval = -1;
+-		return ENOMEM;
+-	}
++    if(buff == NULL){
++        return ENOMEM;
++    }
+ 
+-	copyin(buf, buff, nbytes);
+-	
+-	if(buff == NULL){
+-		*retval = -1;
+-		return EFAULT;
+-	}
++    copyin(buf, buff, nbytes);
++    
++    if(buff == NULL){
++        return EFAULT;
++    }
+ 
+-	buff[nbytes] = '\0';
++    buff[nbytes] = '\0';
+ 
+-	kprintf("%s", buff);
++    kprintf("%s", buff);
+ 
+-	kfree(buff);
++    kfree(buff);
+ 
+-	*retval = nbytes;
+-	return 0;
++    *retval = nbytes;
++    return 0;
+ }
+ 
+ 
+-int sys_read(int fd, int buf, size_t nbytes, int* retval){
++int sys_read(int fd, void *buf, size_t nbytes, int *retval){
+ 
+-	if(fd < STDIN_FILENO || fd >= STDERR_FILENO){
+-		*retval = -1;
+-		return EBADF;
+-	}
++    if(fd < STDIN_FILENO || fd > STDERR_FILENO){
++        return EBADF;
++    }
+ 
+-	if( nbytes == 0 ){
+-		*retval = -1;
+-		return EINVAL;
+-	}
++    if (nbytes == NULL) {
++    	return EINVAL;
++    }
+ 
+-	char* buff = (char*)buf;
++    if (buf == NULL) {
++    	return EFAULT;
++    }
+ 
+-	*buff =getch(); //(buff, nbytes);
++	*(char *)buf = getch();
+ 
+-	if(buff == NULL){
+-		*retval = -1;
+-		return EFAULT;
+-	}
+-
+-	*retval = nbytes; //write one char at a time. one char = one byte
++	*retval = nbytes;
+ 	return 0;
+-}
+-
++}
+\ No newline at end of file
+Index: kern/userprog/runprogram.c
+===================================================================
+--- kern/userprog/runprogram.c	(revision 20)
++++ kern/userprog/runprogram.c	(working copy)
+@@ -25,25 +25,12 @@
+ int
+ runprogram(char *progname, char** args, int arg_num)
+ {
+-	
+-	/*if (progname == NULL || arg_num < 1 || args == NULL) {
+-		return EFAULT;
+-	}*/
+-	struct vnode *v;
+-	vaddr_t entrypoint, stackptr;
+ 	int ret;
+-	//int arg_num = 0;
+-	size_t official_length;
+-	int jj=0;
+-	while(jj < arg_num) {
+-		kprintf("RUNPROGRAM: %s\n", args[jj]);
+-		jj++;
+-	}
+ 	int original_arg_num = arg_num;
+-	//char **kargs = (char **)kmalloc(sizeof(char*)*arg_num);
+ 	vaddr_t kargs[arg_num];
+ 
+-
++	// Step 1 - Open and copy the address space and activate it 
++	struct vnode *v;
+ 	/* Open the file. */
+ 	ret = vfs_open(progname, O_RDONLY, &v);
+ 	if (ret) {
+@@ -63,6 +50,8 @@
+ 	/* Activate it. */
+ 	as_activate(curthread->t_vmspace);
+ 
++	// Step 2- Load the executable file
++	vaddr_t entrypoint;
+ 	/* Load the executable. */
+ 	ret = load_elf(v, &entrypoint);
+ 	if (ret) {
+@@ -73,7 +62,7 @@
+ 
+ 	/* Done with the file now. */
+ 	vfs_close(v);
+-
++	vaddr_t stackptr;
+ 	/* Define the user stack in the address space */
+ 	ret = as_define_stack(curthread->t_vmspace, &stackptr);
+ 	if (ret) {
+@@ -81,6 +70,9 @@
+ 		return ret;
+ 	}
+ 
++	// Copy the args on the stack in reverse order (a3, a2...) with correct padding such 
++	// that the stackpointer addresses are aligned by multiples of 4
++	size_t official_length;
+ 	if (args != NULL ) {
+ 		arg_num = arg_num-1;
+ 		while (arg_num >= 0) {
+@@ -92,17 +84,7 @@
+ 	        
+ 	        if (rem > 0)
+ 	        	arg_len += (4 - rem);
+-            //arg = kmalloc(sizeof(char)*arg_len);
+ 
+-
+-	        /*if(karg == NULL){   //if kmalloc failed, return Not enough memory
+-	            kfree(program_name);
+-	            free_mem(kargs);
+-	            return ENOMEM;
+-	        }*/
+-
+-            //strcpy(arg, args[arg_num]);   //copy the value of kargs into karg
+-
+             stackptr -= arg_len;
+ 	        ret = copyoutstr(args[arg_num], (userptr_t)stackptr, (size_t)original_arg_len, &official_length);
+ 
+@@ -110,13 +92,12 @@
+ 	        	return ret;
+ 	        }
+ 
+-	        //kfree(arg);
+ 	        kargs[arg_num] = stackptr;
+ 	        arg_num--;
+ 	    }
+ 	    kargs[original_arg_num] = NULL;
+ 
+-        //stackptr -= 4*sizeof(char);	// ??
++        stackptr -= 4*sizeof(char);	
+ 
+ 	    int i;
+ 	    for (i = (original_arg_num - 1); i >= 0; i--) {
+@@ -123,20 +104,11 @@
+ 	        stackptr = stackptr - 4;
+ 	        ret = copyout(&kargs[i], (userptr_t)stackptr, 4);
+ 	        if (ret) {
+-	            //kfree(program_name);
+-	            //free_mem(kargs);
+-	            //kfree(kargs); 
+-	            kprintf("RunProgram- copyout2 failed, Result %d, Array Index %d\n",ret, i);
+ 	            return ret;           
+ 	        }
+ 	    }
+ 
+-	    //kfree(program_name);
+-	    //free_mem(kargs);
+-
+ 		/* Warp to user mode. */
+-		//md_usermode(0/*argc*/, NULL /*userspace addr of argv*/,
+-		//	    stackptr, entrypoint);
+ 		md_usermode(original_arg_num, (userptr_t)stackptr, stackptr, entrypoint);
+ 	}
+ 	else
+Index: kern/thread/thread.c
+===================================================================
+--- kern/thread/thread.c	(revision 20)
++++ kern/thread/thread.c	(working copy)
+@@ -35,7 +35,24 @@
+ /* Total number of outstanding threads. Does not count zombies[]. */
+ static int numthreads;
+ 
++
++
+ /*
++	process_table_init is called in kern/main/main.c upon kernel startup (in function kmain())
++	Process table allocated on kernel heap
++	For now, MAX_PROCESSES is 128
++	Initially, all entries are set to NULL
++*/
++void process_table_init(void){
++	int i;
++	for( i = 0; i < MAX_PROCESSES; i++){
++		process_table[i].p_thread = NULL;
++		process_table[i].exited = 0;
++		process_table[i].ppid = -1;
++	}
++}
++
++/*
+  * Create a thread. This is used both to create the first thread's 
+  * thread structure and to create subsequent threads.
+  */
+@@ -66,33 +83,29 @@
+ 	//initializing thread pid
+ 
+ 	int thread_pid;
+-	for(thread_pid=PID_MIN ; thread_pid<MAX_PROCESSES ; thread_pid++){
+-		if(process_table[thread_pid].p_thread == NULL)
+-		{
++	for( thread_pid = PID_MIN; thread_pid < MAX_PROCESSES; thread_pid++){
++		if(process_table[thread_pid].p_thread == NULL && process_table[thread_pid].exited == 0){
++
+ 			thread->t_pid = thread_pid;
+-			process_table[thread_pid].pid = thread_pid;
+ 			process_table[thread_pid].p_thread = thread;
++			process_table[thread_pid].exited = 0;
+ 
+-
+ 			//init the semaphore = 0 so that if the parent calls wait_pid it has to P() on the semaphore
+ 			//until the thread releases the semaphore in thread_exit
+ 			process_table[thread_pid].exit_semaphore = sem_create("exit_semaphore",0);
+ 
+-			if(thread_pid==PID_MIN){ //init process
++			if(thread_pid == PID_MIN){ //init process
+ 				process_table[thread_pid].ppid = -1;
+ 			}
+ 			else{
+ 				process_table[thread_pid].ppid = curthread->t_pid;
+ 			}
+-
+-			user_threads_num++;
+-
+ 			break;
+ 		}
+ 	}
+ 
+ 	if(thread_pid == MAX_PROCESSES){
+-		kprintf("thread.c: NO SPACES AVAILABLE ON PROCESS TABLE!\n");
++		//kprintf("thread.c: NO SPACES AVAILABLE ON PROCESS TABLE!\n");
+ 		return NULL;
+ 	}
+ 
+@@ -99,24 +112,7 @@
+ 	return thread;
+ }
+ 
+-/*
+-	process_table_init is called in kern/main/main.c upon kernel startup (in function kmain())
+-	Process table allocated on kernel heap
+-	For now, MAX_PROCESSES is 128
+-	Initially, all entries are set to NULL
+-*/
+-void process_table_init(void){
+-	int i;
+-	for(i=0 ; i<MAX_PROCESSES ; i++){
+-		process_table[i].p_thread = NULL;
+-		process_table[i].exited = 0;
+-		process_table[i].pid = -1;
+-		process_table[i].ppid = -1;
+-	}
+ 
+-	user_threads_num = -1;	//since the first thread created is init (created in thread_bootstrap)
+-}
+-
+ /*
+  * Destroy a thread.
+  *
+@@ -129,6 +125,8 @@
+ {
+ 	assert(thread != curthread);
+ 
++	//kprintf("in thread destroy for thread = %d\n", thread->t_pid);
++
+ 	// If you add things to the thread structure, be sure to dispose of
+ 	// them here or in thread_exit.
+ 
+@@ -160,6 +158,7 @@
+ 	for (i=0; i<array_getnum(zombies); i++) {
+ 		struct thread *z = array_getguy(zombies, i);
+ 		assert(z!=curthread);
++		//kprintf("in exorcise: calling thread_destroy on thread = %d\n", z->t_pid);
+ 		thread_destroy(z);
+ 	}
+ 	result = array_setsize(zombies, 0);
+@@ -500,7 +499,7 @@
+ 	//free the process table
+ 	process_table[curthread->t_pid].exited = 1;
+ 	V(process_table[curthread->t_pid].exit_semaphore);
+-	user_threads_num--;
++	process_table[curthread->t_pid].p_thread = NULL;
+ 
+ 	if (curthread->t_vmspace) {
+ 		/*
+Index: kern/arch/mips/mips/syscall.c
+===================================================================
+--- kern/arch/mips/mips/syscall.c	(revision 20)
++++ kern/arch/mips/mips/syscall.c	(working copy)
+@@ -73,7 +73,7 @@
+ 
+ 	switch (callno) {
+ 		case SYS__exit:
+-		err = sys__exit(tf->tf_a0, &retval);
++		sys__exit(tf->tf_a0);
+ 		break;
+ 
+ 	    case SYS_reboot:
+@@ -85,7 +85,7 @@
+ 		break;
+ 
+ 		case SYS_waitpid:
+-		err = sys_waitpid(tf->tf_a0, tf->tf_a1, tf->tf_a2, &retval);
++		err = sys_waitpid(tf->tf_a0, (int *)tf->tf_a1, tf->tf_a2, &retval);
+ 		break;
+ 
+ 		case SYS_getpid:
+@@ -96,12 +96,12 @@
+  		err = sys_write(tf->tf_a0, tf->tf_a1, tf->tf_a2, &retval);
+  		break;
+ 
+-        case SYS_read:
+-        err = sys_read(tf->tf_a0, tf->tf_a1, tf->tf_a2, &retval);
+-        break;
++ 		case SYS_read:
++ 		err = sys_read(tf->tf_a0, tf->tf_a1, tf->tf_a2, &retval);
++ 		break;
+ 
+ 	    default:
+-		kprintf("Unknown syscall %d\n", callno);
++		//kprintf("Unknown syscall %d\n", callno);
+ 		err = ENOSYS;
+ 		break;
+ 	}
+@@ -133,9 +133,7 @@
+ 	assert(curspl==0);
+ }
+ 
+-void
+-md_forkentry(struct trapframe *tf, struct addrspace * as)
+-{
++void md_forkentry(struct trapframe *tf, struct addrspace * as){
+ 	/*
+ 	 * This function is provided as a reminder. You need to write
+ 	 * both it and the code that calls it.
+@@ -143,8 +141,6 @@
+ 	 * Thus, you can trash it and do things another way if you prefer.
+ 	 */
+ 
+-	lock_acquire(fork_lock);
+-
+ 	// 1) copy the parent's trapframe from the heap
+ 
+ 	struct trapframe new_tf;
+@@ -168,10 +164,6 @@
+ 	new_tf.tf_a3 = 0;
+ 	new_tf.tf_v0 = 0;		/* signal no error */
+ 
+-
+-	lock_release(fork_lock);
+-
+-
+ 	// 4) switch to usermode
+ 
+     mips_usermode(&new_tf);
+Index: kern/arch/mips/mips/trap.c
+===================================================================
+--- kern/arch/mips/mips/trap.c	(revision 20)
++++ kern/arch/mips/mips/trap.c	(working copy)
+@@ -45,7 +45,7 @@
+ 	/*
+ 	 * You will probably want to change this.
+ 	 */
+-	panic("I don't know how to handle this\n");
++	sys__exit(code);
+ }
+ 
+ /*
+Index: kern/arch/mips/mips/dumbvm.c
+===================================================================
+--- kern/arch/mips/mips/dumbvm.c	(revision 20)
++++ kern/arch/mips/mips/dumbvm.c	(working copy)
+@@ -169,6 +169,9 @@
+ 	as->as_npages2 = 0;
+ 	as->as_stackpbase = 0;
+ 
++	//create the thread's page table
++
++
+ 	return as;
+ }
+ 
+Index: kern/arch/mips/mips/ram.c
+===================================================================
+--- kern/arch/mips/mips/ram.c	(revision 20)
++++ kern/arch/mips/mips/ram.c	(working copy)
+@@ -86,5 +86,10 @@
+ {
+ 	*lo = firstpaddr;
+ 	*hi = lastpaddr;
+-	firstpaddr = lastpaddr = 0;
++	//firstpaddr = lastpaddr = 0;
+ }
++
++void ram_reset(){
++	firstpaddr = 0;
++	lastpaddr = 0;
++}
+\ No newline at end of file
+Index: kern/arch/mips/include/vm.h
+===================================================================
+--- kern/arch/mips/include/vm.h	(revision 20)
++++ kern/arch/mips/include/vm.h	(working copy)
+@@ -34,6 +34,7 @@
+  * a valid address, and will make a *huge* mess if you scribble on it.
+  */
+ #define PADDR_TO_KVADDR(paddr) ((paddr)+MIPS_KSEG0)
++#define KVADDR_TO_PADDR(vaddr) ((vaddr)-MIPS_KSEG0)
+ 
+ /*
+  * The top of user space. (Actually, the address immediately above the
+@@ -69,6 +70,7 @@
+ void ram_bootstrap(void);
+ paddr_t ram_stealmem(unsigned long npages);
+ void ram_getsize(paddr_t *lo, paddr_t *hi);
++void ram_reset();
+ 
+ /*
+  * The ELF executable type for this platform.
+Index: kern/include/thread.h
+===================================================================
+--- kern/include/thread.h	(revision 20)
++++ kern/include/thread.h	(working copy)
+@@ -12,8 +12,6 @@
+ //---------------------- process stuff ----------------------------------------
+ 
+  struct process{
+-
+-	int pid;					//process pid
+ 	int ppid;					//parent pid
+ 	int exited;
+ 	int exit_code;				
+@@ -25,9 +23,6 @@
+ struct process process_table[MAX_PROCESSES];
+ struct lock* fork_lock;
+ 
+-//initialized to -1 in process_table_init since the first thread created is init (created in thread_bootstrap)
+-int user_threads_num;
+-
+ /*
+ 	process_table_init is called in kern/main/main.c upon kernel startup (in function kmain())
+ 	Process table allocated on kernel heap
+@@ -121,12 +116,6 @@
+ void thread_wakeup(const void *addr);
+ 
+ /*
+- * Cause ONE thread sleeping on the specified address to wake up.
+- * Interrupts must be disabled.
+- */
+-void thread_wakeup_one(const void *addr);
+-
+-/*
+  * Return nonzero if there are any threads sleeping on the specified
+  * address. Meant only for diagnostic purposes.
+  */
+Index: kern/include/syscall.h
+===================================================================
+--- kern/include/syscall.h	(revision 20)
++++ kern/include/syscall.h	(working copy)
+@@ -11,15 +11,15 @@
+ 
+ int sys_write(int fd, int buf, size_t nbytes, int* retval);
+ 
+-int sys_read(int fd, int buf, size_t nbytes, int* retval);
+-
+ int sys_getpid(int *retval);
+ 
+-int sys__exit(int exitcode, int *retval);
++void sys__exit(int exitcode);
+ 
+ int sys_fork(struct trapframe *tf, int *retval);
+ 
+ int sys_waitpid(int pid, int *status, int options, int *retval);
+ 
++int sys_read(int fd, void *buf, size_t nbytes, int *retval);
++
+ #endif /* _SYSCALL_H_ */
+ 
+Index: kern/include/addrspace.h
+===================================================================
+--- kern/include/addrspace.h	(revision 20)
++++ kern/include/addrspace.h	(working copy)
+@@ -24,6 +24,13 @@
+ 	paddr_t as_stackpbase;
+ #else
+ 	/* Put stuff here for your VM system */
++	vaddr_t as_vbase1;
++	paddr_t as_pbase1;
++	size_t as_npages1;
++	vaddr_t as_vbase2;
++	paddr_t as_pbase2;
++	size_t as_npages2;
++	paddr_t as_stackpbase;
+ #endif
+ };
+ 
+Index: kern/include/vm.h
+===================================================================
+--- kern/include/vm.h	(revision 20)
++++ kern/include/vm.h	(working copy)
+@@ -3,13 +3,26 @@
+ 
+ #include <machine/vm.h>
+ 
+-/*
+- * VM system-related definitions.
+- *
+- * You'll probably want to add stuff here.
+- */
+ 
++paddr_t phys_addr_start;
++paddr_t phys_addr_end;
+ 
++typedef enum {
++	freed,
++	dirty,
++	fixed,
++	clean
++} pstate_t;
++
++struct cmap_entry{
++	struct addrspace* as;
++	paddr_t pa;
++	pstate_t state;
++	int first_page;
++	int num_pages;
++};
++
++
+ /* Fault-type arguments to vm_fault() */
+ #define VM_FAULT_READ        0    /* A read was attempted */
+ #define VM_FAULT_WRITE       1    /* A write was attempted */
+@@ -18,6 +31,7 @@
+ 
+ /* Initialization function */
+ void vm_bootstrap(void);
++paddr_t getppages(unsigned long npages);
+ 
+ /* Fault handling function called by trap code */
+ int vm_fault(int faulttype, vaddr_t faultaddress);
+Index: kern/main/main.c
+===================================================================
+--- kern/main/main.c	(revision 20)
++++ kern/main/main.c	(working copy)
+@@ -16,7 +16,6 @@
+ #include <vm.h>
+ #include <syscall.h>
+ #include <version.h>
+-
+ #include "hello.h"                  #Aya and Harshita
+ 
+ /*
+@@ -84,8 +83,7 @@
+ 	/* Default bootfs - but ignore failure, in case emu0 doesn't exist */
+ 	vfs_setbootfs("emu0");
+ 
+-	fork_lock = lock_create("fork_lock");
+-
++	//fork_lock = lock_create("fork_lock");
+ 	/*
+ 	 * Make sure various things aren't screwed up.
+ 	 */
+Index: kern/main/menu.c
+===================================================================
+--- kern/main/menu.c	(revision 20)
++++ kern/main/menu.c	(working copy)
+@@ -116,10 +116,14 @@
+ 		return result;
+ 	}
+ 
+-	int err;
+-	int status = process_table[most_recent_child->t_pid].exited;
+-	sys_waitpid(most_recent_child->t_pid, &status, 0, &err);
++	int err, status;
+ 
++
++	//sys_waitpid(most_recent_child->t_pid, &status, 0, &err);
++
++	if(process_table[most_recent_child->t_pid].exited==0){
++		P(process_table[most_recent_child->t_pid].exit_semaphore);
++	}
+ 	return 0;
+ }
+ 
+Index: kern/conf/conf.kern
+===================================================================
+--- kern/conf/conf.kern	(revision 20)
++++ kern/conf/conf.kern	(working copy)
+@@ -392,6 +392,7 @@
+ #
+ 
+ optofffile dumbvm   vm/addrspace.c
++file 	  vm/vm.c
+ 
+ #
+ # Network
+Index: kern/vm/addrspace.c
+===================================================================
+--- kern/vm/addrspace.c	(revision 20)
++++ kern/vm/addrspace.c	(working copy)
+@@ -1,131 +0,0 @@
+-#include <types.h>
+-#include <kern/errno.h>
+-#include <lib.h>
+-#include <addrspace.h>
+-#include <vm.h>
+-
+-/*
+- * Note! If OPT_DUMBVM is set, as is the case until you start the VM
+- * assignment, this file is not compiled or linked or in any way
+- * used. The cheesy hack versions in dumbvm.c are used instead.
+- */
+-
+-struct addrspace *
+-as_create(void)
+-{
+-	struct addrspace *as = kmalloc(sizeof(struct addrspace));
+-	if (as==NULL) {
+-		return NULL;
+-	}
+-
+-	/*
+-	 * Initialize as needed.
+-	 */
+-
+-	return as;
+-}
+-
+-int
+-as_copy(struct addrspace *old, struct addrspace **ret)
+-{
+-	struct addrspace *newas;
+-
+-	newas = as_create();
+-	if (newas==NULL) {
+-		return ENOMEM;
+-	}
+-
+-	/*
+-	 * Write this.
+-	 */
+-
+-	(void)old;
+-	
+-	*ret = newas;
+-	return 0;
+-}
+-
+-void
+-as_destroy(struct addrspace *as)
+-{
+-	/*
+-	 * Clean up as needed.
+-	 */
+-	
+-	kfree(as);
+-}
+-
+-void
+-as_activate(struct addrspace *as)
+-{
+-	/*
+-	 * Write this.
+-	 */
+-
+-	(void)as;  // suppress warning until code gets written
+-}
+-
+-/*
+- * Set up a segment at virtual address VADDR of size MEMSIZE. The
+- * segment in memory extends from VADDR up to (but not including)
+- * VADDR+MEMSIZE.
+- *
+- * The READABLE, WRITEABLE, and EXECUTABLE flags are set if read,
+- * write, or execute permission should be set on the segment. At the
+- * moment, these are ignored. When you write the VM system, you may
+- * want to implement them.
+- */
+-int
+-as_define_region(struct addrspace *as, vaddr_t vaddr, size_t sz,
+-		 int readable, int writeable, int executable)
+-{
+-	/*
+-	 * Write this.
+-	 */
+-
+-	(void)as;
+-	(void)vaddr;
+-	(void)sz;
+-	(void)readable;
+-	(void)writeable;
+-	(void)executable;
+-	return EUNIMP;
+-}
+-
+-int
+-as_prepare_load(struct addrspace *as)
+-{
+-	/*
+-	 * Write this.
+-	 */
+-
+-	(void)as;
+-	return 0;
+-}
+-
+-int
+-as_complete_load(struct addrspace *as)
+-{
+-	/*
+-	 * Write this.
+-	 */
+-
+-	(void)as;
+-	return 0;
+-}
+-
+-int
+-as_define_stack(struct addrspace *as, vaddr_t *stackptr)
+-{
+-	/*
+-	 * Write this.
+-	 */
+-
+-	(void)as;
+-
+-	/* Initial user-level stack pointer */
+-	*stackptr = USERSTACK;
+-	
+-	return 0;
+-}
+-
+Index: testbin/Makefile
+===================================================================
+--- testbin/Makefile	(revision 20)
++++ testbin/Makefile	(working copy)
+@@ -47,3 +47,4 @@
+ # But not:
+ #    malloctest     (no malloc/free until you write it)
+ #    userthreads    (no support in kernel API in base system)
++#	(cd printchar && $(MAKE) $@)
+Index: testbin/crash/crash.c
+===================================================================
+--- testbin/crash/crash.c	(revision 20)
++++ testbin/crash/crash.c	(working copy)
+@@ -208,7 +208,7 @@
+ 		       "platforms, in which\ncase it'll appear to fail.\n");
+ 
+ 		printf("Choose: ");
+-		op = getchar();
++		op = getchar();//'*';
+ 	}
+ 
+ 	if (op=='*') {
+@@ -216,11 +216,11 @@
+ 			printf("Running: [%c] %s\n", ops[i].ch, ops[i].name);
+ 			pid = fork();
+ 			if (pid<0) {
+-				/* error */
++				// error
+ 				warn("fork");
+ 			}
+ 			else if (pid==0) {
+-				/* child */
++				// child
+ 				ops[i].f();
+ 				printf("I wasn't killed - test fails!\n");
+ 				_exit(1);
+Index: testbin/huge/huge.c
+===================================================================
+--- testbin/huge/huge.c	(revision 20)
++++ testbin/huge/huge.c	(working copy)
+@@ -11,8 +11,8 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
+-#define PageSize	4096
+-#define NumPages	512
++#define PageSize	1024
++#define NumPages	256
+ 
+ int sparse[NumPages][PageSize];	/* use only the first element in the row */
+ 
+Index: testbin/getpidtest/getpidtest
+===================================================================
+Cannot display: file marked as a binary type.
+svn:mime-type = application/octet-stream
+Index: testbin/getpidtest/getpidtest.c
+===================================================================
+--- testbin/getpidtest/getpidtest.c	(revision 20)
++++ testbin/getpidtest/getpidtest.c	(working copy)
+@@ -2,7 +2,7 @@
+  * getpid - test getpid().
+  *
+  */
+-
++/*
+ #include <unistd.h>
+ #include <string.h>
+ #include <stdlib.h>
+@@ -16,8 +16,162 @@
+     char c;
+ 	mypid = getpid();
+ 	printf("My PID is: %d\n", mypid);
+-    printf("enter one char: ");
+-    c = getchar();
+-    printf("input character is %c\n", c);
++	mypid = fork();
++	printf("PID is: %d\n", mypid);
++	if(mypid!=0){
++		int status;
++		waitpid(mypid, &status, 0);
++	}
++	printf(" %d complete.\n",);
+ 	return 0;
+ }
++*/
++/*
++ * forktest - test fork().
++ *
++ * This should work correctly when fork is implemented.
++ *
++ * It should also continue to work after subsequent assignments, most
++ * notably after implementing the virtual memory system.
++ */
++
++#include <unistd.h>
++#include <string.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <err.h>
++
++/*
++ * This is used by all processes, to try to help make sure all
++ * processes have a distinct address space.
++ */
++static volatile int mypid;
++
++/*
++ * Helper function for fork that prints a warning on error.
++ */
++static
++int
++dofork(void)
++{
++	int pid;
++	pid = fork();
++	if (pid < 0) {
++		warn("fork");
++	}
++	return pid;
++}
++
++/*
++ * Check to make sure each process has its own address space. Write
++ * the pid into the data segment and read it back repeatedly, making
++ * sure it's correct every time.
++ */
++static
++void
++check(void)
++{
++	int i;
++
++	mypid = getpid();
++	
++	/* Make sure each fork has its own address space. */
++	for (i=0; i<800; i++) {
++		volatile int seenpid;
++		seenpid = mypid;
++		if (seenpid != getpid()) {
++			errx(1, "pid mismatch (%d, should be %d) "
++			     "- your vm is broken!", 
++			     seenpid, getpid());
++		}
++	}
++}
++
++/*
++ * Wait for a child process.
++ *
++ * This assumes dowait is called the same number of times as dofork
++ * and passed its results in reverse order. Any forks that fail send
++ * us -1 and are ignored. The first 0 we see indicates the fork that
++ * generated the current process; that means it's time to exit. Only
++ * the parent of all the processes returns from the chain of dowaits.
++ */
++static
++void
++dowait(int nowait, int pid)
++{
++	int x;
++
++	if (pid<0) {
++		/* fork in question failed; just return */
++		return;
++	}
++	if (pid==0) {
++		/* in the fork in question we were the child; exit */
++		exit(0);
++	}
++
++	if (!nowait) {
++		if (waitpid(pid, &x, 0)<0) {
++			warn("waitpid");
++		}
++		else if (x!=0) {
++			warnx("pid %d: exit %d", pid, x);
++		}
++	}
++}
++
++/*
++ * Actually run the test.
++ */
++static
++void
++test(int nowait)
++{
++	int pid0, pid1, pid2, pid3;
++
++	/*
++	 * Caution: This generates processes geometrically.
++	 *
++	 * It is unrolled to encourage gcc to registerize the pids,
++	 * to prevent wait/exit problems if fork corrupts memory.
++	 */
++
++	pid0 = dofork();
++	putchar('0');
++	check();
++	pid1 = dofork();
++	putchar('1');
++	check();
++
++	/*
++	 * These must be called in reverse order to avoid waiting
++	 * improperly.
++	 */
++	dowait(nowait, pid1);
++	printf("after dowait pid3\n");
++	dowait(nowait, pid0);
++	printf("after dowait pid2\n");
++
++	putchar('\n');
++}
++
++int
++main(int argc, char *argv[])
++{
++	int nowait=0;
++
++	if (argc==2 && !strcmp(argv[1], "-w")) {
++		nowait=1;
++	}
++	else if (argc!=1 && argc!=0) {
++		warnx("usage: forktest [-w]");
++		return 1;
++	}
++	warnx("Starting.");
++
++	test(nowait);
++
++	warnx("Complete.");
++	return 0;
++}
+Index: testbin/getpidtest
+===================================================================
+--- testbin/getpidtest	(revision 20)
++++ testbin/getpidtest	(working copy)
+
+Property changes on: testbin/getpidtest
+___________________________________________________________________
+Added: svn:ignore
+## -0,0 +1 ##
++forktest
